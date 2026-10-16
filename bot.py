@@ -53,15 +53,14 @@ def send_result_message(text):
 def is_market_open():
     """ตรวจสอบว่าตลาด Forex เปิดทำการอยู่หรือไม่ (ปิดวันเสาร์-อาทิตย์)"""
     now_utc = datetime.now(timezone.utc)
-    weekday = now_utc.weekday()  # 0=จันทร์, ..., 5=เสาร์, 6=อาทิตย์
+    weekday = now_utc.weekday()
     hour = now_utc.hour
 
-    # วันเสาร์ทั้งวัน หรือวันอาทิตย์ก่อนตลาดเปิด (ตลาดเปิดประมาณ 22:00 UTC ของวันอาทิตย์) หรือวันศุกร์หลังตลาดปิด (22:00 UTC)
-    if weekday == 5:  # วันเสาร์
+    if weekday == 5:
         return False
-    if weekday == 6 and hour < 22:  # วันอาทิตย์ก่อน 4 ทุ่ม UTC
+    if weekday == 6 and hour < 22:
         return False
-    if weekday == 4 and hour >= 22:  # วันศุกร์หลัง 4 ทุ่ม UTC
+    if weekday == 4 and hour >= 22:
         return False
     return True
 
@@ -79,17 +78,8 @@ def get_candles(asset, retries=3):
         time.sleep(1)
     return None
 
-def wait_for_candle(asset, target_time, timeout=20):
-    end = time.time() + timeout
-    while time.time() < end:
-        df = get_candles(asset, retries=1)
-        if df is not None and target_time in df.index:
-            return df
-        time.sleep(2)
-    return None
-
 def analyze_market_with_score(df):
-    """วิเคราะห์และประเมินคะแนนความมั่นใจ เฉพาะคู่ที่ตลาดเปิดและกราฟสวยจริงๆ"""
+    """วิเคราะห์และประเมินคะแนนความมั่นใจ เฉพาะจุดที่กราฟสวยจริงๆ"""
     if len(df) < 25:
         return None, 0, 0, 0
 
@@ -119,17 +109,18 @@ def analyze_market_with_score(df):
 
     return signal, last["close"], rsi_val, score
 
-print("✅ บอท AI ตรวจสอบสถานะตลาดอัตโนมัติ เริ่มทำงานแล้ว")
-send_signal_message("🤖 AI Market-Aware Mode พร้อม! ตรวจสอบสถานะตลาดเปิด-ปิด และส่งเฉพาะไม้ที่มั่นใจที่สุดเท่านั้น")
+print("✅ บอท AI โหมดเตือนล่วงหน้า (Pre-Signal) เริ่มทำงานแล้ว")
+send_signal_message("🤖 AI Pre-Signal Mode พร้อม! บอทจะส่งข้อความเตือนล่วงหน้าก่อนเปลี่ยนแท่งเทียนให้คุณเตรียมเปิดจอรอ")
 
-last_scan = None
+last_pre_scan = None
+last_action_min = None
 last_heartbeat = time.time()
+pending_candidate = None
 
 while True:
     try:
         current_time = time.time()
 
-        # หากตลาดปิดอยู่ จะพักการทำงานชั่วคราวเพื่อประหยัดทรัพยากร
         if not is_market_open():
             time.sleep(60)
             continue
@@ -143,65 +134,73 @@ while True:
             send_signal_message(f"🟢 ตลาดเปิด | บอทยังเฝ้ากราฟปกติ\n⏰ เวลา: {time_str}\n📊 สถิติรวม: ชนะ {global_stats['win']} | แพ้ {global_stats['loss']} (Win Rate: {wr_all:.2f}%)")
 
         now_utc = pd.Timestamp.now(tz="UTC")
-        now_min = now_utc.floor("min")
+        current_min = now_utc.floor("min")
+        current_sec = now_utc.second
 
-        if now_utc.second >= 1 and last_scan != now_min:
-            last_scan = now_min
-            prev_min = now_min - pd.Timedelta(minutes=1)
-
-            best_candidate = None
+        # 1. ช่วงวินาทีที่ 50 ของนาทีปัจจุบัน: ทำการสแกนล่วงหน้า (Pre-Scan) เพื่อเตือนให้เตรียมตัว
+        if current_sec >= 50 and last_pre_scan != current_min:
+            last_pre_scan = current_min
+            pending_candidate = None
             highest_score = -1
 
-            # สแกนเฉพาะคู่ที่ตลาดเปิดและไม่ติด Cooldown
             for asset in SYMBOLS:
                 if current_time < stats[asset]["cooldown_until"]:
                     continue
 
-                df = wait_for_candle(asset, prev_min, timeout=3)
-                if df is None:
+                df = get_candles(asset, retries=1)
+                if df is None or len(df) < 25:
                     continue
 
-                # เช็กความสดของข้อมูล (ป้องกันดึงราคาค้างช่วงตลาดปิด)
-                latest_candle_time = df.index[-1]
-                if (now_utc - latest_candle_time).total_seconds() > 120:
-                    continue  # ข้ามคู่ที่ไม่มีการอัปเดตราคาใหม่
-
-                df_filtered = df[df.index < now_min]
-                signal, entry_price, rsi_val, score = analyze_market_with_score(df_filtered)
+                signal, entry_price, rsi_val, score = analyze_market_with_score(df)
 
                 if signal and score > highest_score:
                     highest_score = score
-                    best_candidate = {
+                    pending_candidate = {
                         "asset": asset,
                         "signal": signal,
                         "price": entry_price,
                         "rsi": rsi_val
                     }
 
-            # ส่งเฉพาะคู่ที่ดีที่สุดเมื่อตลาดเปิดและมีความมั่นใจ
-            if best_candidate:
-                asset = best_candidate["asset"]
-                signal = best_candidate["signal"]
-                entry_price = best_candidate["price"]
-                rsi_val = best_candidate["rsi"]
+            # ถ้าเจอคู่ที่น่าสนใจ ส่งข้อความเตือนล่วงหน้าให้เตรียมเปิดจอรอทันที!
+            if pending_candidate:
+                pre_time_str = (datetime.now(tz_thai) + timedelta(minutes=1)).strftime("%H:%M")
+                pre_msg = (
+                    f"⏳ เตรียมตัวให้พร้อม! (Pre-Signal)\n"
+                    f"🎯 เล็งคู่: {pending_candidate['asset']}\n"
+                    f"📊 ทิศทางที่คาดการณ์: {pending_candidate['signal']}\n"
+                    f"⏰ เปิดจอรอเตรียมกดตอนเวลา {pre_time_str} น."
+                )
+                send_signal_message(pre_msg)
+
+        # 2. เมื่อขึ้นวินาทีที่ 1 ของนาทีใหม่: ส่งสัญญาณจริงและจับตาผลลัพธ์
+        if current_sec >= 1 and last_action_min != current_min:
+            last_action_min = current_min
+
+            if pending_candidate:
+                asset = pending_candidate["asset"]
+                signal = pending_candidate["signal"]
+                entry_price = pending_candidate["price"]
+                rsi_val = pending_candidate["rsi"]
                 time_str = datetime.now(tz_thai).strftime("%H:%M:%S")
 
                 signal_msg = (
-                    f"💎 สัญญาณตลาดเปิด ความมั่นใจสูง ({asset})\n"
+                    f"🚨 **ลุยเลย! เปิดออเดอร์** ({asset})\n"
                     f"⏰ เวลา: {time_str}\n"
                     f"🎯 แนะนำ: {signal}\n"
-                    f"💵 ราคา: {entry_price:.5f}\n"
+                    f"💵 ราคาเปิด: {entry_price:.5f}\n"
                     f"📈 RSI: {rsi_val:.1f}"
                 )
                 send_signal_message(signal_msg)
 
-                target_close = now_min + pd.Timedelta(minutes=1, seconds=3)
+                # รอประเมินผลจบแท่ง 1 นาที
+                target_close = current_min + pd.Timedelta(minutes=1, seconds=3)
                 while pd.Timestamp.now(tz="UTC") < target_close:
                     time.sleep(0.3)
 
-                res_df = wait_for_candle(asset, now_min, timeout=12)
-                if res_df is not None and now_min in res_df.index:
-                    eval_c = res_df.loc[now_min]
+                res_df = get_candles(asset, retries=2)
+                if res_df is not None and current_min in res_df.index:
+                    eval_c = res_df.loc[current_min]
                     open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
 
                     if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
@@ -235,6 +234,8 @@ while True:
                         f"🔥 Win Rate คู่นี้: {wr:.2f}%"
                     )
                     send_result_message(result_msg)
+
+                pending_candidate = None  # ล้างค่าเตรียมรอบถัดไป
 
         time.sleep(0.5)
     except Exception as e:
