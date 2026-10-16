@@ -9,20 +9,40 @@ import yfinance as yf
 # ดึงค่าความปลอดภัยจากระบบ Railway อัตโนมัติ
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN", "").strip()
 LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
-ASSET = os.getenv("ASSET", "EURUSD").strip()
 
 if not LINE_ACCESS_TOKEN or not LINE_USER_ID:
     print("❌ กรุณาตั้งค่า LINE_ACCESS_TOKEN และ LINE_USER_ID ใน Railway ก่อน")
     exit(1)
 
 tz_thai = timezone(timedelta(hours=7))
+
+# รวมคู่เงิน Forex สากลทั้งหมดที่สามารถดึงข้อมูลได้จริงผ่าน Yahoo Finance
 SYMBOLS = {
+    # Major Pairs (คู่เงินหลัก)
     "EURUSD": "EURUSD=X",
     "GBPUSD": "GBPUSD=X",
     "USDJPY": "USDJPY=X",
+    "AUDUSD": "AUDUSD=X",
+    "USDCAD": "USDCAD=X",
+    "NZDUSD": "NZDUSD=X",
+    "USDCHF": "USDCHF=X",
+    
+    # Cross Pairs (คู่เงินรองยอดนิยม)
+    "EURGBP": "EURGBP=X",
     "EURJPY": "EURJPY=X",
+    "GBPJPY": "GBPJPY=X",
+    "AUDJPY": "AUDJPY=X",
+    "EURAUD": "EURAUD=X",
+    "EURCAD": "EURCAD=X",
+    "GBPCAD": "GBPCAD=X",
+    "GBPAUD": "GBPAUD=X",
+    "AUDNZD": "AUDNZD=X",
+    "CHFJPY": "CHFJPY=X",
+    "CADJPY": "CADJPY=X",
+    "AUDCAD": "AUDCAD=X"
 }
-stats = {"win": 0, "loss": 0, "tie": 0}
+
+stats = {asset: {"win": 0, "loss": 0, "tie": 0} for asset in SYMBOLS}
 
 def send_line_message(text):
     url = "https://api.line.me/v2/bot/message/push"
@@ -86,8 +106,8 @@ def analyze_market(df):
 
     return signal, last['close'], last['rsi']
 
-print(f"✅ บอทเริ่มเฝ้ากราฟ {ASSET} บน Railway แล้ว")
-send_line_message(f"🤖 บอททำงานบน Railway สำเร็จ!\n📊 คู่เงิน: {ASSET}\n⏱ Timeframe: 1 นาที")
+print("✅ บอทเริ่มเฝ้ากราฟ Forex ทุกคู่เงินบน Railway แล้ว")
+send_line_message(f"🤖 บอททำงานบน Railway สำเร็จ!\n📊 กำลังเฝ้าคู่เงินสากลทั้งหมด {len(SYMBOLS)} คู่ พร้อมกัน")
 
 last_scan = None
 
@@ -100,60 +120,64 @@ while True:
             last_scan = now_min
             prev_min = now_min - pd.Timedelta(minutes=1)
 
-            df = wait_for_candle(ASSET, prev_min)
-            if df is None:
-                continue
-
-            df = df[df.index < now_min]
-            if len(df) < 60:
-                continue
-
-            signal, entry_price, rsi_val = analyze_market(df)
-
-            if signal:
-                time_str = datetime.now(tz_thai).strftime("%H:%M:%S")
-                msg = (
-                    f"🚨 สัญญาณ 1 นาที ({ASSET})\n"
-                    f"⏰ เวลาไทย: {time_str}\n"
-                    f"🎯 แนะนำกด: {signal}\n"
-                    f"💵 ราคาล่าสุด: {entry_price:.5f}\n"
-                    f"📈 RSI: {rsi_val:.1f}\n"
-                    f"⏳ รอสรุปผล..."
-                )
-                print(f"[{time_str}] ส่งสัญญาณ: {signal}")
-                send_line_message(msg)
-
-                target_close = now_min + pd.Timedelta(minutes=1, seconds=5)
-                while pd.Timestamp.now(tz="UTC") < target_close:
-                    time.sleep(0.5)
-
-                res_df = wait_for_candle(ASSET, now_min, timeout=30)
-                if res_df is None:
+            # วนลูปเช็กทีละคู่เงินครบทุกคู่ในระบบ
+            for asset in SYMBOLS:
+                df = wait_for_candle(asset, prev_min, timeout=8)
+                if df is None:
                     continue
 
-                eval_c = res_df.loc[now_min]
-                open_p, close_p = float(eval_c['open']), float(eval_c['close'])
+                df_filtered = df[df.index < now_min]
+                if len(df_filtered) < 60:
+                    continue
 
-                if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
-                    res_txt = "✅ WIN (ชนะ)"
-                    stats["win"] += 1
-                elif close_p == open_p:
-                    res_txt = "⚖️ TIE (เสมอ)"
-                    stats["tie"] += 1
-                else:
-                    res_txt = "❌ LOSS (แพ้)"
-                    stats["loss"] += 1
+                signal, entry_price, rsi_val = analyze_market(df_filtered)
 
-                total = stats["win"] + stats["loss"]
-                wr = (stats["win"] / total * 100) if total > 0 else 0.0
+                if signal:
+                    time_str = datetime.now(tz_thai).strftime("%H:%M:%S")
+                    msg = (
+                        f"🚨 สัญญาณ 1 นาที ({asset})\n"
+                        f"⏰ เวลาไทย: {time_str}\n"
+                        f"🎯 แนะนำกด: {signal}\n"
+                        f"💵 ราคาล่าสุด: {entry_price:.5f}\n"
+                        f"📈 RSI: {rsi_val:.1f}\n"
+                        f"⏳ รอสรุปผล..."
+                    )
+                    print(f"[{time_str}] ส่งสัญญาณ {asset}: {signal}")
+                    send_line_message(msg)
 
-                res_msg = (
-                    f"🏁 สรุปผล ({ASSET})\n"
-                    f"ผลลัพธ์: {res_txt}\n"
-                    f"🏆 ชนะ {stats['win']} | แพ้ {stats['loss']} | เสมอ {stats['tie']}\n"
-                    f"🔥 Win Rate: {wr:.2f}%"
-                )
-                send_line_message(res_msg)
+                    # รอสรุปผลแท่งเทียน
+                    target_close = now_min + pd.Timedelta(minutes=1, seconds=5)
+                    while pd.Timestamp.now(tz="UTC") < target_close:
+                        time.sleep(0.5)
+
+                    res_df = wait_for_candle(asset, now_min, timeout=20)
+                    if res_df is not None and now_min in res_df.index:
+                        eval_c = res_df.loc[now_min]
+                        open_p, close_p = float(eval_c['open']), float(eval_c['close'])
+
+                        if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
+                            res_txt = "✅ WIN (ชนะ)"
+                            stats[asset]["win"] += 1
+                        elif close_p == open_p:
+                            res_txt = "⚖️ TIE (เสมอ)"
+                            stats[asset]["tie"] += 1
+                        else:
+                            res_txt = "❌ LOSS (แพ้)"
+                            stats[asset]["loss"] += 1
+
+                        s = stats[asset]
+                        total = s["win"] + s["loss"]
+                        wr = (s["win"] / total * 100) if total > 0 else 0.0
+
+                        res_msg = (
+                            f"🏁 สรุปผล ({asset})\n"
+                            f"ผลลัพธ์: {res_txt}\n"
+                            f"🏆 ชนะ {s['win']} | แพ้ {s['loss']} | เสมอ {s['tie']}\n"
+                            f"🔥 Win Rate: {wr:.2f}%"
+                        )
+                        send_line_message(res_msg)
+
+                time.sleep(0.5)
         else:
             time.sleep(0.5)
     except Exception as e:
