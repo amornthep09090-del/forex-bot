@@ -89,7 +89,6 @@ def wait_for_candle(asset, target_time, timeout=20):
 
 def analyze_market(df):
   df = df.copy()
-  # ปรับให้ไวขึ้น: ใช้ EMA 20 และ RSI 9 เพื่อให้จับจังหวะได้ไวขึ้น
   df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
   delta = df["close"].diff()
   gain = (delta.where(delta > 0, 0)).rolling(window=9).mean()
@@ -104,7 +103,6 @@ def analyze_market(df):
 
   last = df.iloc[-1]
   signal = None
-  # ขยายโซน RSI จาก 35/65 เป็น 40/60 เพื่อให้ออกออเดอร์บ่อยขึ้น
   if (
       (last["close"] > last["ema20"])
       and (last["close"] <= last["bb_lower"])
@@ -121,16 +119,30 @@ def analyze_market(df):
   return signal, last["close"], last["rsi"]
 
 
-print("✅ บอทโหมดสัญญาณไวเริ่มทำงานบน Railway แล้ว")
+print("✅ บอทรวมโหมดรายงานตัวทุก 30 นาที เริ่มทำงานบน Railway แล้ว")
 send_line_message(
-    "🤖 บอทโหมดสปีด (สัญญาณไวขึ้น) ทำงานแล้ว!\n📊 เฝ้าคู่เงินสากลทั้งหมด"
-    f" {len(SYMBOLS)} คู่"
+    "🤖 บอททำงานบน Railway สำเร็จ!\n📊 กำลังเฝ้าคู่เงินสากลทั้งหมด"
+    f" {len(SYMBOLS)} คู่\n⏰ รายงานสถานะทุก 30 นาที"
 )
 
 last_scan = None
+last_heartbeat = time.time()  # บันทึกเวลาเริ่มต้นสำหรับเช็กสถานะทุก 30 นาที
 
 while True:
   try:
+    current_time = time.time()
+
+    # ตรวจสอบทุกๆ 30 นาที (1800 วินาที) เพื่อส่งรายงานว่าบอทยังทำงานอยู่
+    if current_time - last_heartbeat >= 1800:
+      last_heartbeat = current_time
+      time_str = datetime.now(tz_thai).strftime("%H:%M:%S")
+      hb_msg = (
+          f"🟢 บอทยังทำงานปกติ (Heartbeat)\n⏰ เวลาไทย: {time_str}\n📊"
+          f" กำลังเฝ้ากราฟ {len(SYMBOLS)} คู่เงิน"
+      )
+      send_line_message(hb_msg)
+      print(f"[{time_str}] ส่งรายงานสถานะ (Heartbeat) เรียบร้อย")
+
     now_utc = pd.Timestamp.now(tz="UTC")
     now_min = now_utc.floor("min")
 
@@ -144,7 +156,7 @@ while True:
           continue
 
         df_filtered = df[df.index < now_min]
-        if len(df_filtered) < 30:  # ลดขั้นต่ำลงเพื่อให้ข้อมูลพร้อมไวขึ้น
+        if len(df_filtered) < 30:
           continue
 
         signal, entry_price, rsi_val = analyze_market(df_filtered)
