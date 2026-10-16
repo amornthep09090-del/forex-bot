@@ -5,27 +5,17 @@ import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from flask import Flask, request, abort
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-# ดึงค่าความปลอดภัยจากระบบ Railway
-LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN", "").strip()
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
+# ดึงค่า Token และ User ID จากระบบ Railway
+LINE_SIGNAL_TOKEN = os.getenv("LINE_SIGNAL_TOKEN", "").strip()
+LINE_RESULT_TOKEN = os.getenv("LINE_RESULT_TOKEN", "").strip()
+LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
 
-if not LINE_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-    print("❌ กรุณาตั้งค่า LINE_ACCESS_TOKEN และ LINE_CHANNEL_SECRET ใน Railway Variables ให้ครบถ้วน")
+if not LINE_SIGNAL_TOKEN or not LINE_RESULT_TOKEN or not LINE_USER_ID:
+    print("❌ กรุณาตั้งค่า LINE_SIGNAL_TOKEN, LINE_RESULT_TOKEN และ LINE_USER_ID ใน Railway Variables ให้ครบถ้วน")
     exit(1)
 
-line_bot_api = LineBotApi(LINE_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
-app = Flask(__name__)
-
 tz_thai = timezone(timedelta(hours=7))
-
-# สถานะบอท (เริ่มต้นให้ทำงานอัตโนมัติ)
-bot_running = True
 
 # รายชื่อคู่เงินสากลทั้งหมด
 SYMBOLS = {
@@ -38,51 +28,44 @@ SYMBOLS = {
     "AUDCAD": "AUDCAD=X",
 }
 
-# สถิติแยกตามคู่เงิน และสถิติรวมทั้งหมด (Global Stats)
 stats = {asset: {"win": 0, "loss": 0, "tie": 0, "consecutive_loss": 0, "cooldown_until": 0} for asset in SYMBOLS}
 global_stats = {"win": 0, "loss": 0, "tie": 0}
 
-# รับข้อความสั่งการจาก LINE (Webhook)
-@app.route("/callback", methods=['POST'])
-def callback():
-    signature = request.headers['X-Line-Signature']
-    body = request.get_data(as_text=True)
+# ฟังก์ชันส่งข้อความ "จุดเข้า" (บอทสัญญาณ)
+def send_signal_message(text):
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_SIGNAL_TOKEN}"
+    }
+    payload = {
+        "to": LINE_USER_ID,
+        "messages": [{"type": "text", "text": text}]
+    }
     try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
-    return 'OK'
+        r = requests.post(url, headers=headers, json=payload, timeout=10)
+        if r.status_code != 200:
+            print(f"⚠️ Signal LINE Error: {r.text}")
+    except Exception as e:
+        print(f"⚠️ Signal Exception: {e}")
 
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    global bot_running
-    text = event.message.text.strip().lower()
-    reply_text = ""
-
-    if text in ["เปิด", "start", "on"]:
-        bot_running = True
-        reply_text = "🟢 บอทถูกเปิดใช้งาน (Start) เรียบร้อยแล้ว กำลังเฝ้ากราฟปกติครับ"
-    elif text in ["ปิด", "stop", "off"]:
-        bot_running = False
-        reply_text = "🔴 บอทถูกระงับการทำงานชั่วคราว (Stop) แล้ว พิมพ์ 'เปิด' เพื่อเริ่มใหม่"
-    elif text in ["สถิติ", "stats", "winrate"]:
-        total = global_stats["win"] + global_stats["loss"]
-        wr = (global_stats["win"] / total * 100) if total > 0 else 0.0
-        reply_text = (
-            f"📊 สถิติรวมทั้งหมด (Global Stats)\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"🏆 ชนะ: {global_stats['win']} ครั้ง\n"
-            f"❌ แพ้: {global_stats['loss']} ครั้ง\n"
-            f"⚖️ เสมอ: {global_stats['tie']} ครั้ง\n"
-            f"🔥 Win Rate รวม: {wr:.2f}%"
-        )
-    else:
-        reply_text = "🤖 คำสั่งที่ใช้ได้:\n- พิมพ์ 'เปิด' เพื่อเริ่มบอท\n- พิมพ์ 'ปิด' เพื่อหยุดบอท\n- พิมพ์ 'สถิติ' ดูผลงานรวม"
-
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=reply_text)
-    )
+# ฟังก์ชันส่งข้อความ "สรุปผล" (บอทผลลัพธ์)
+def send_result_message(text):
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_RESULT_TOKEN}"
+    }
+    payload = {
+        "to": LINE_USER_ID,
+        "messages": [{"type": "text", "text": text}]
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=10)
+        if r.status_code != 200:
+            print(f"⚠️ Result LINE Error: {r.text}")
+    except Exception as e:
+        print(f"⚠️ Result Exception: {e}")
 
 def get_candles(asset, retries=3):
     for _ in range(retries):
@@ -129,83 +112,100 @@ def analyze_market(df):
 
     return signal, last["close"], last["rsi"]
 
-# ฟังก์ชันรันลูปบอทเบื้องหลัง (Background Scanner)
-def background_bot_loop():
-    global bot_running
-    last_scan = None
-    print("✅ ระบบสแกนกราฟเบื้องหลังเริ่มทำงานแล้ว")
-    
-    while True:
-        try:
-            if not bot_running:
-                time.sleep(2)
-                continue
+print("✅ บอท Worker แยก 2 บอท เริ่มทำงานบน Railway แล้ว")
+send_signal_message(f"🤖 บอทสัญญาณเริ่มทำงาน!\n📊 กำลังเฝ้าคู่เงินสากลทั้งหมด {len(SYMBOLS)} คู่")
 
-            now_utc = pd.Timestamp.now(tz="UTC")
-            now_min = now_utc.floor("min")
+last_scan = None
+last_heartbeat = time.time()
 
-            if now_utc.second >= 1 and last_scan != now_min:
-                last_scan = now_min
-                prev_min = now_min - pd.Timedelta(minutes=1)
-                current_time = time.time()
+while True:
+    try:
+        current_time = time.time()
 
-                for asset in SYMBOLS:
-                    if not bot_running:
-                        break
-                    if current_time < stats[asset]["cooldown_until"]:
-                        continue
+        # รายงานตัวสถานะทำงานปกติทุก 30 นาที
+        if current_time - last_heartbeat >= 1800:
+            last_heartbeat = current_time
+            time_str = datetime.now(tz_thai).strftime("%H:%M:%S")
+            send_signal_message(f"🟢 บอทยังทำงานปกติ (Heartbeat)\n⏰ เวลาไทย: {time_str}\n📊 เฝ้ากราฟ {len(SYMBOLS)} คู่")
 
-                    df = wait_for_candle(asset, prev_min, timeout=6)
-                    if df is None:
-                        continue
+        now_utc = pd.Timestamp.now(tz="UTC")
+        now_min = now_utc.floor("min")
 
-                    df_filtered = df[df.index < now_min]
-                    if len(df_filtered) < 30:
-                        continue
+        if now_utc.second >= 1 and last_scan != now_min:
+            last_scan = now_min
+            prev_min = now_min - pd.Timedelta(minutes=1)
 
-                    signal, entry_price, rsi_val = analyze_market(df_filtered)
+            for asset in SYMBOLS:
+                if current_time < stats[asset]["cooldown_until"]:
+                    continue
 
-                    if signal:
-                        time_str = datetime.now(tz_thai).strftime("%H:%M:%S")
-                        print(f"[{time_str}] พบสัญญาณ {asset}: {signal}")
+                df = wait_for_candle(asset, prev_min, timeout=6)
+                if df is None:
+                    continue
 
-                        target_close = now_min + pd.Timedelta(minutes=1, seconds=5)
-                        while pd.Timestamp.now(tz="UTC") < target_close:
-                            time.sleep(0.5)
+                df_filtered = df[df.index < now_min]
+                if len(df_filtered) < 30:
+                    continue
 
-                        res_df = wait_for_candle(asset, now_min, timeout=15)
-                        if res_df is not None and now_min in res_df.index:
-                            eval_c = res_df.loc[now_min]
-                            open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
+                signal, entry_price, rsi_val = analyze_market(df_filtered)
 
-                            if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
-                                stats[asset]["win"] += 1
-                                global_stats["win"] += 1
-                                stats[asset]["consecutive_loss"] = 0
-                            elif close_p == open_p:
-                                stats[asset]["tie"] += 1
-                                global_stats["tie"] += 1
-                            else:
-                                stats[asset]["loss"] += 1
-                                global_stats["loss"] += 1
-                                stats[asset]["consecutive_loss"] += 1
+                if signal:
+                    time_str = datetime.now(tz_thai).strftime("%H:%M:%S")
+                    
+                    # 1. ส่งสัญญาณจุดเข้าผ่าน บอทที่ 1
+                    signal_msg = (
+                        f"🚨 สัญญาณเข้าออเดอร์ ({asset})\n"
+                        f"⏰ เวลาไทย: {time_str}\n"
+                        f"🎯 แนะนำกด: {signal}\n"
+                        f"💵 ราคา: {entry_price:.5f}\n"
+                        f"📈 RSI: {rsi_val:.1f}"
+                    )
+                    send_signal_message(signal_msg)
 
-                                if stats[asset]["consecutive_loss"] >= 2:
-                                    stats[asset]["cooldown_until"] = time.time() + 900
+                    target_close = now_min + pd.Timedelta(minutes=1, seconds=5)
+                    while pd.Timestamp.now(tz="UTC") < target_close:
+                        time.sleep(0.5)
 
-                    time.sleep(0.2)
-            else:
-                time.sleep(0.5)
-        except Exception as e:
-            print(f"⚠️ Loop Error: {e}")
-            time.sleep(5)
+                    res_df = wait_for_candle(asset, now_min, timeout=15)
+                    if res_df is not None and now_min in res_df.index:
+                        eval_c = res_df.loc[now_min]
+                        open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
 
-if __name__ == "__main__":
-    import threading
-    t = threading.Thread(target=background_bot_loop)
-    t.daemon = True
-    t.start()
-    
-    # ดึงค่าพอร์ตจากระบบ Railway โดยตรง (ตั้งค่าให้รองรับพอร์ต 8080)
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+                        if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
+                            res_txt = "✅ WIN (ชนะ)"
+                            stats[asset]["win"] += 1
+                            global_stats["win"] += 1
+                            stats[asset]["consecutive_loss"] = 0
+                        elif close_p == open_p:
+                            res_txt = "⚖️ TIE (เสมอ)"
+                            stats[asset]["tie"] += 1
+                            global_stats["tie"] += 1
+                        else:
+                            res_txt = "❌ LOSS (แพ้)"
+                            stats[asset]["loss"] += 1
+                            global_stats["loss"] += 1
+                            stats[asset]["consecutive_loss"] += 1
+
+                            if stats[asset]["consecutive_loss"] >= 2:
+                                stats[asset]["cooldown_until"] = time.time() + 900
+                                send_signal_message(f"🧠 AI Notice: คู่เงิน {asset} แพ้ติดกัน 2 ครั้ง พักชั่วคราว 15 นาที")
+
+                        # 2. ส่งผลลัพธ์ผ่าน บอทที่ 2
+                        s = stats[asset]
+                        total = s["win"] + s["loss"]
+                        wr = (s["win"] / total * 100) if total > 0 else 0.0
+
+                        result_msg = (
+                            f"🏁 สรุปผลลัพธ์ ({asset})\n"
+                            f"ผล: {res_txt}\n"
+                            f"🏆 ชนะ {s['win']} | แพ้ {s['loss']}\n"
+                            f"🔥 Win Rate คู่คู่นี้: {wr:.2f}%"
+                        )
+                        send_result_message(result_msg)
+
+                time.sleep(0.2)
+        else:
+            time.sleep(0.5)
+    except Exception as e:
+        print(f"⚠️ Loop Error: {e}")
+        time.sleep(5)
