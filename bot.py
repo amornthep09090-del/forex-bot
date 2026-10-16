@@ -28,7 +28,7 @@ SYMBOLS = {
     "AUDCAD": "AUDCAD=X",
 }
 
-# ระบบสถิติและการเรียนรู้ AI แยกตามคู่เงิน
+# ระบบสถิติและการเรียนรู้ AI (พัก 30 นาทีเมื่อแพ้ 2ไม้ติด)
 stats = {asset: {"win": 0, "loss": 0, "tie": 0, "consecutive_loss": 0, "cooldown_until": 0} for asset in SYMBOLS}
 global_stats = {"win": 0, "loss": 0, "tie": 0}
 
@@ -73,8 +73,8 @@ def wait_for_candle(asset, target_time, timeout=20):
         time.sleep(2)
     return None
 
-def evaluate_asset(df):
-    """คำนวณหาความน่าจะเป็นและให้คะแนนความน่าสนใจของคู่เงินนั้นๆ"""
+def analyze_market(df):
+    """วิเคราะห์เชิงเทคนิคด้วย Bollinger Bands + RSI เพื่อคัดเลือกเฉพาะจุดที่น่าเข้าเทรดจริง ๆ"""
     df = df.copy()
     delta = df["close"].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=7).mean()
@@ -82,21 +82,24 @@ def evaluate_asset(df):
     rs = gain / loss.replace(0, np.nan)
     df["rsi"] = (100 - (100 / (1 + rs))).fillna(50)
 
+    df["sma20"] = df["close"].rolling(window=20).mean()
+    df["std20"] = df["close"].rolling(window=20).std()
+    df["bb_upper"] = df["sma20"] + (df["std20"] * 1.8)
+    df["bb_lower"] = df["sma20"] - (df["std20"] * 1.8)
+
     last = df.iloc[-1]
-    rsi_val = last["rsi"]
+    signal = None
     
-    # กำหนดทิศทาง
-    if last["close"] >= last["open"]:
+    # กรองเฉพาะจุดที่ราคาทะลุขอบ Bollinger Bands และ RSI สนับสนุนความน่าจะเป็นสูง
+    if (last["close"] <= last["bb_lower"]) and (last["rsi"] < 35):
         signal = "BUY 🟢 (CALL)"
-    else:
+    elif (last["close"] >= last["bb_upper"]) and (last["rsi"] > 65):
         signal = "SELL 🔴 (PUT)"
 
-    # คำนวณ Score ความมั่นใจ (ยิ่ง RSI ห่างจาก 50 มาก ยิ่งมีความแรงของเทรนด์สูง)
-    confidence_score = abs(rsi_val - 50)
-    return signal, last["close"], rsi_val, confidence_score
+    return signal, last["close"], last["rsi"]
 
-print("✅ บอท AI คัดเลือกคู่ที่ดีที่สุด (Best Pick) เริ่มทำงานแล้ว")
-send_signal_message("🤖 AI Smart Picker เริ่มทำงาน! สแกน 19 คู่เงิน คัดตัวที่ดีที่สุดทุกๆ 1 นาที")
+print("✅ บอท AI วิเคราะห์กรองสัญญาณแม่นยำ เริ่มทำงานแล้ว")
+send_signal_message("🤖 AI Smart Filter ทำงานแล้ว! สแกน 19 คู่เงิน วิเคราะห์เฉพาะจุดที่น่าเข้า และระบบพัก 30 นาทีพร้อมใช้งาน")
 
 last_scan = None
 last_heartbeat = time.time()
@@ -105,13 +108,13 @@ while True:
     try:
         current_time = time.time()
 
-        # รายงานตัวทุก 30 นาที
+        # รายงานสถานะทุก 30 นาที
         if current_time - last_heartbeat >= 1800:
             last_heartbeat = current_time
             time_str = datetime.now(tz_thai).strftime("%H:%M:%S")
             tot = global_stats["win"] + global_stats["loss"]
             wr_all = (global_stats["win"] / tot * 100) if tot > 0 else 0.0
-            send_signal_message(f"🟢 บอทยังทำงานปกติ\n⏰ เวลา: {time_str}\n📊 สถิติรวม: ชนะ {global_stats['win']} | แพ้ {global_stats['loss']} (Win Rate: {wr_all:.2f}%)")
+            send_signal_message(f"🟢 บอทยังเฝ้ากราฟปกติ\n⏰ เวลา: {time_str}\n📊 สถิติรวม: ชนะ {global_stats['win']} | แพ้ {global_stats['loss']} (Win Rate: {wr_all:.2f}%)")
 
         now_utc = pd.Timestamp.now(tz="UTC")
         now_min = now_utc.floor("min")
@@ -120,11 +123,9 @@ while True:
             last_scan = now_min
             prev_min = now_min - pd.Timedelta(minutes=1)
 
-            best_candidate = None
-            highest_score = -1
-
-            # 1. สแกนทั้ง 19 คู่เงินเพื่อหาตัวที่ "ดีที่สุด" ในนาทีนี้
+            # วนลูปเช็กทีละคู่เงิน ถ้าคู่ไหนเข้าเกณฑ์ค่อยส่งสัญญาณ
             for asset in SYMBOLS:
+                # 🧠 เช็กว่าติด Cooldown (พัก 30 นาที) อยู่ไหม
                 if current_time < stats[asset]["cooldown_until"]:
                     continue
 
@@ -133,86 +134,69 @@ while True:
                     continue
 
                 df_filtered = df[df.index < now_min]
-                if len(df_filtered) < 10:
+                if len(df_filtered) < 25:
                     continue
 
-                signal, entry_price, rsi_val, score = evaluate_asset(df_filtered)
+                signal, entry_price, rsi_val = analyze_market(df_filtered)
 
-                # บวกโบนัสคะแนนให้คู่เงินที่มีสถิติชนะสะสมดี
-                s = stats[asset]
-                total_s = s["win"] + s["loss"]
-                win_rate_s = (s["win"] / total_s) if total_s > 0 else 0.5
-                final_score = score * (win_rate_s + 0.5)
+                # ถ้าวิเคราะห์แล้วพบจุดที่น่าเข้าเทรด ถึงจะส่งแจ้งเตือน
+                if signal:
+                    time_str = datetime.now(tz_thai).strftime("%H:%M:%S")
 
-                if final_score > highest_score:
-                    highest_score = final_score
-                    best_candidate = {
-                        "asset": asset,
-                        "signal": signal,
-                        "price": entry_price,
-                        "rsi": rsi_val
-                    }
-
-            # 2. ถือว่าได้ตัวที่ดีที่สุดแล้ว ส่งสัญญาณเฉพาะตัวนี้เท่านั้น!
-            if best_candidate:
-                asset = best_candidate["asset"]
-                signal = best_candidate["signal"]
-                entry_price = best_candidate["price"]
-                rsi_val = best_candidate["rsi"]
-                time_str = datetime.now(tz_thai).strftime("%H:%M:%S")
-
-                signal_msg = (
-                    f"🔥 AI Top Pick ({asset})\n"
-                    f"⏰ เวลา: {time_str}\n"
-                    f"🎯 แนะนำ: {signal}\n"
-                    f"💵 ราคา: {entry_price:.5f}\n"
-                    f"📈 RSI: {rsi_val:.1f}"
-                )
-                send_signal_message(signal_msg)
-
-                # รอจบแท่งเทียน 1 นาทีเพื่อประเมินผล
-                target_close = now_min + pd.Timedelta(minutes=1, seconds=3)
-                while pd.Timestamp.now(tz="UTC") < target_close:
-                    time.sleep(0.3)
-
-                res_df = wait_for_candle(asset, now_min, timeout=12)
-                if res_df is not None and now_min in res_df.index:
-                    eval_c = res_df.loc[now_min]
-                    open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
-
-                    if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
-                        res_txt = "✅ WIN (ชนะ)"
-                        stats[asset]["win"] += 1
-                        global_stats["win"] += 1
-                        stats[asset]["consecutive_loss"] = 0
-                    elif close_p == open_p:
-                        res_txt = "⚖️ TIE (เสมอ)"
-                        stats[asset]["tie"] += 1
-                        global_stats["tie"] += 1
-                    else:
-                        res_txt = "❌ LOSS (แพ้)"
-                        stats[asset]["loss"] += 1
-                        global_stats["loss"] += 1
-                        stats[asset]["consecutive_loss"] += 1
-
-                        # 🧠 AI เรียนรู้ตัวเอง: แพ้ติดกัน 2 ครั้ง พักคู่นี้ 15 นาที
-                        if stats[asset]["consecutive_loss"] >= 2:
-                            stats[asset]["cooldown_until"] = time.time() + 900
-                            send_signal_message(f"🧠 AI Notice: คู่เงิน {asset} แพ้ติดกัน 2 ครั้ง สั่งพักชั่วคราว 15 นาที")
-
-                    s = stats[asset]
-                    total = s["win"] + s["loss"]
-                    wr = (s["win"] / total * 100) if total > 0 else 0.0
-
-                    result_msg = (
-                        f"🏁 ผลลัพธ์ Top Pick ({asset})\n"
-                        f"ผล: {res_txt}\n"
-                        f"🏆 ชนะ {s['win']} | แพ้ {s['loss']}\n"
-                        f"🔥 Win Rate คู่นี้: {wr:.2f}%"
+                    signal_msg = (
+                        f"🎯 สัญญาณวิเคราะห์แม่นยำ ({asset})\n"
+                        f"⏰ เวลา: {time_str}\n"
+                        f"📈 แนะนำ: {signal}\n"
+                        f"💵 ราคา: {entry_price:.5f}\n"
+                        f"📊 RSI: {rsi_val:.1f}"
                     )
-                    send_result_message(result_msg)
+                    send_signal_message(signal_msg)
 
-        time.sleep(0.5)
+                    # รอจบแท่งเทียน 1 นาทีเพื่อประเมินผล WIN / LOSS
+                    target_close = now_min + pd.Timedelta(minutes=1, seconds=3)
+                    while pd.Timestamp.now(tz="UTC") < target_close:
+                        time.sleep(0.3)
+
+                    res_df = wait_for_candle(asset, now_min, timeout=12)
+                    if res_df is not None and now_min in res_df.index:
+                        eval_c = res_df.loc[now_min]
+                        open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
+
+                        if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
+                            res_txt = "✅ WIN (ชนะ)"
+                            stats[asset]["win"] += 1
+                            global_stats["win"] += 1
+                            stats[asset]["consecutive_loss"] = 0 # รีเซ็ตเมื่อชนะ
+                        elif close_p == open_p:
+                            res_txt = "⚖️ TIE (เสมอ)"
+                            stats[asset]["tie"] += 1
+                            global_stats["tie"] += 1
+                        else:
+                            res_txt = "❌ LOSS (แพ้)"
+                            stats[asset]["loss"] += 1
+                            global_stats["loss"] += 1
+                            stats[asset]["consecutive_loss"] += 1
+
+                            # 🧠 AI เรียนรู้ตัวเอง: แพ้ติดกัน 2 ไม้ติด สั่งพักคู่เงินนี้ 30 นาทีทันที
+                            if stats[asset]["consecutive_loss"] >= 2:
+                                stats[asset]["cooldown_until"] = time.time() + 1800  # 1800 วินาที = 30 นาที
+                                send_signal_message(f"🧠 AI Notice: คู่เงิน {asset} แพ้ติดกัน 2 ไม้ติด! สั่งพักการเทรด 30 นาทีเพื่อป้องกันความเสี่ยง")
+
+                        s = stats[asset]
+                        total = s["win"] + s["loss"]
+                        wr = (s["win"] / total * 100) if total > 0 else 0.0
+
+                        result_msg = (
+                            f"🏁 สรุปผลลัพธ์ ({asset})\n"
+                            f"ผล: {res_txt}\n"
+                            f"🏆 ชนะ {s['win']} | แพ้ {s['loss']}\n"
+                            f"🔥 Win Rate คู่นี้: {wr:.2f}%"
+                        )
+                        send_result_message(result_msg)
+
+                time.sleep(0.1)
+        else:
+            time.sleep(0.5)
     except Exception as e:
         print(f"⚠️ Loop Error: {e}")
         time.sleep(5)
