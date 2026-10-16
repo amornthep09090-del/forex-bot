@@ -39,7 +39,8 @@ SYMBOLS = {
     "AUDCAD": "AUDCAD=X",
 }
 
-stats = {asset: {"win": 0, "loss": 0, "tie": 0} for asset in SYMBOLS}
+# ระบบบันทึกสถิติและการเรียนรู้ของ AI (เก็บประวัติแพ้ชนะ และระบบพักตัวเมื่อแพ้ติดกัน)
+stats = {asset: {"win": 0, "loss": 0, "tie": 0, "consecutive_loss": 0, "cooldown_until": 0} for asset in SYMBOLS}
 
 
 def send_line_message(text):
@@ -89,59 +90,52 @@ def wait_for_candle(asset, target_time, timeout=20):
 
 def analyze_market(df):
   df = df.copy()
-  df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+  # ใช้ RSI 7 และ Bollinger Bands เพื่อให้จับจังหวะสวิงได้ไวและออกออเดอร์บ่อยขึ้น
   delta = df["close"].diff()
-  gain = (delta.where(delta > 0, 0)).rolling(window=9).mean()
-  loss = (-delta.where(delta < 0, 0)).rolling(window=9).mean()
+  gain = (delta.where(delta > 0, 0)).rolling(window=7).mean()
+  loss = (-delta.where(delta < 0, 0)).rolling(window=7).mean()
   rs = gain / loss.replace(0, np.nan)
   df["rsi"] = (100 - (100 / (1 + rs))).fillna(50)
 
   df["sma20"] = df["close"].rolling(window=20).mean()
   df["std20"] = df["close"].rolling(window=20).std()
-  df["bb_upper"] = df["sma20"] + (df["std20"] * 2.0)
-  df["bb_lower"] = df["sma20"] - (df["std20"] * 2.0)
+  df["bb_upper"] = df["sma20"] + (df["std20"] * 1.8)  # ลดความกว้างลงเล็กน้อยให้ออกบ่อย
+  df["bb_lower"] = df["sma20"] - (df["std20"] * 1.8)
 
   last = df.iloc[-1]
   signal = None
-  if (
-      (last["close"] > last["ema20"])
-      and (last["close"] <= last["bb_lower"])
-      and (last["rsi"] < 40)
-  ):
+  
+  # เงื่อนไขแบบออกบ่อย (Aggressive): ทะลุขอบ BB + RSI หลุดโซน 45 / 55
+  if (last["close"] <= last["bb_lower"]) and (last["rsi"] < 45):
     signal = "BUY 🟢 (CALL)"
-  elif (
-      (last["close"] < last["ema20"])
-      and (last["close"] >= last["bb_upper"])
-      and (last["rsi"] > 60)
-  ):
+  elif (last["close"] >= last["bb_upper"]) and (last["rsi"] > 55):
     signal = "SELL 🔴 (PUT)"
 
   return signal, last["close"], last["rsi"]
 
 
-print("✅ บอทรวมโหมดรายงานตัวทุก 30 นาที เริ่มทำงานบน Railway แล้ว")
+print("✅ บอท AI")
 send_line_message(
-    "🤖 บอททำงานบน Railway สำเร็จ!\n📊 กำลังเฝ้าคู่เงินสากลทั้งหมด"
-    f" {len(SYMBOLS)} คู่\n⏰ รายงานสถานะทุก 30 นาที"
+    "🤖 บอท AI Adaptive (โหมดออกบ่อย + เรียนรู้เมื่อแพ้) ทำงานแล้ว!\n📊 เฝ้าคู่เงิน"
+    f" {len(SYMBOLS)} คู่"
 )
 
 last_scan = None
-last_heartbeat = time.time()  # บันทึกเวลาเริ่มต้นสำหรับเช็กสถานะทุก 30 นาที
+last_heartbeat = time.time()
 
 while True:
   try:
     current_time = time.time()
 
-    # ตรวจสอบทุกๆ 30 นาที (1800 วินาที) เพื่อส่งรายงานว่าบอทยังทำงานอยู่
+    # รายงานสถานะทุก 30 นาที
     if current_time - last_heartbeat >= 1800:
       last_heartbeat = current_time
       time_str = datetime.now(tz_thai).strftime("%H:%M:%S")
       hb_msg = (
-          f"🟢 บอทยังทำงานปกติ (Heartbeat)\n⏰ เวลาไทย: {time_str}\n📊"
+          f"🟢 บอท AI ยังทำงานปกติ (Heartbeat)\n⏰ เวลาไทย: {time_str}\n📊"
           f" กำลังเฝ้ากราฟ {len(SYMBOLS)} คู่เงิน"
       )
       send_line_message(hb_msg)
-      print(f"[{time_str}] ส่งรายงานสถานะ (Heartbeat) เรียบร้อย")
 
     now_utc = pd.Timestamp.now(tz="UTC")
     now_min = now_utc.floor("min")
@@ -151,6 +145,10 @@ while True:
       prev_min = now_min - pd.Timedelta(minutes=1)
 
       for asset in SYMBOLS:
+        # ระบบ AI เรียนรู้: ถ้าคู่เงินไหนแพ้ติดกันจนโดนสั่งพัก (Cooldown) จะข้ามไปก่อน
+        if current_time < stats[asset]["cooldown_until"]:
+          continue
+
         df = wait_for_candle(asset, prev_min, timeout=8)
         if df is None:
           continue
@@ -164,12 +162,12 @@ while True:
         if signal:
           time_str = datetime.now(tz_thai).strftime("%H:%M:%S")
           msg = (
-              f"🚨 สัญญาณไว 1 นาที ({asset})\n"
+              f"🚨 สัญญาณ AI 1 นาที ({asset})\n"
               f"⏰ เวลาไทย: {time_str}\n"
               f"🎯 แนะนำกด: {signal}\n"
               f"💵 ราคาล่าสุด: {entry_price:.5f}\n"
               f"📈 RSI: {rsi_val:.1f}\n"
-              f"⏳ รอสรุปผล..."
+              f"⏳ รอ AI ประเมินผล..."
           )
           print(f"[{time_str}] ส่งสัญญาณ {asset}: {signal}")
           send_line_message(msg)
@@ -188,19 +186,29 @@ while True:
             ):
               res_txt = "✅ WIN (ชนะ)"
               stats[asset]["win"] += 1
+              stats[asset]["consecutive_loss"] = 0  # รีเซ็ตค่าความผิดพลาดเมื่อชนะ
             elif close_p == open_p:
               res_txt = "⚖️ TIE (เสมอ)"
               stats[asset]["tie"] += 1
             else:
               res_txt = "❌ LOSS (แพ้)"
               stats[asset]["loss"] += 1
+              stats[asset]["consecutive_loss"] += 1
+
+              # 🧠 ระบบ AI เรียนรู้ตัวเอง: ถ้าแพ้ติดต่อกัน 2 ครั้ง บอทจะสั่งพักคู่เงินนี้ 15 นาทีเพื่อป้องกันลากยาว
+              if stats[asset]["consecutive_loss"] >= 2:
+                stats[asset]["cooldown_until"] = time.time() + 900  # พัก 15 นาที
+                send_line_message(
+                    f"🧠 AI Notice: คู่เงิน {asset} แพ้ติดกัน 2 ครั้ง"
+                    " ระบบสั่งพักคู่คู่นี้ชั่วคราว 15 นาที เพื่อปรับตัว"
+                )
 
             s = stats[asset]
             total = s["win"] + s["loss"]
             wr = (s["win"] / total * 100) if total > 0 else 0.0
 
             res_msg = (
-                f"🏁 สรุปผล ({asset})\n"
+                f"🏁 สรุปผล AI ({asset})\n"
                 f"ผลลัพธ์: {res_txt}\n"
                 f"🏆 ชนะ {s['win']} | แพ้ {s['loss']} | เสมอ {s['tie']}\n"
                 f"🔥 Win Rate: {wr:.2f}%"
