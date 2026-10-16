@@ -1,0 +1,161 @@
+import os
+import time
+from datetime import datetime, timezone, timedelta
+import requests
+import pandas as pd
+import numpy as np
+import yfinance as yf
+
+# ดึงค่าความปลอดภัยจากระบบ Railway อัตโนมัติ
+LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN", "").strip()
+LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
+ASSET = os.getenv("ASSET", "EURUSD").strip()
+
+if not LINE_ACCESS_TOKEN or not LINE_USER_ID:
+    print("❌ กรุณาตั้งค่า LINE_ACCESS_TOKEN และ LINE_USER_ID ใน Railway ก่อน")
+    exit(1)
+
+tz_thai = timezone(timedelta(hours=7))
+SYMBOLS = {
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDJPY": "USDJPY=X",
+    "EURJPY": "EURJPY=X",
+}
+stats = {"win": 0, "loss": 0, "tie": 0}
+
+def send_line_message(text):
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_ACCESS_TOKEN}"
+    }
+    payload = {
+        "to": LINE_USER_ID,
+        "messages": [{"type": "text", "text": text}]
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=10)
+        if r.status_code != 200:
+            print(f"⚠️ ส่ง LINE ไม่สำเร็จ: {r.text}")
+    except Exception as e:
+        print(f"⚠️ ข้อผิดพลาด LINE: {e}")
+
+def get_candles(asset, retries=3):
+    for _ in range(retries):
+        try:
+            df = yf.Ticker(SYMBOLS[asset]).history(period="1d", interval="1m")
+            if df is not None and not df.empty:
+                df = df.rename(columns=str.lower)
+                idx = df.index
+                df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+                return df[["open", "high", "low", "close"]].astype(float)
+        except Exception:
+            pass
+        time.sleep(1)
+    return None
+
+def wait_for_candle(asset, target_time, timeout=20):
+    end = time.time() + timeout
+    while time.time() < end:
+        df = get_candles(asset, retries=1)
+        if df is not None and target_time in df.index:
+            return df
+        time.sleep(3)
+    return None
+
+def analyze_market(df):
+    df = df.copy()
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df['rsi'] = (100 - (100 / (1 + rs))).fillna(50)
+    df['sma20'] = df['close'].rolling(window=20).mean()
+    df['std20'] = df['close'].rolling(window=20).std()
+    df['bb_upper'] = df['sma20'] + (df['std20'] * 2.0)
+    df['bb_lower'] = df['sma20'] - (df['std20'] * 2.0)
+
+    last = df.iloc[-1]
+    signal = None
+    if (last['close'] > last['ema50']) and (last['close'] <= last['bb_lower']) and (last['rsi'] < 35):
+        signal = "BUY 🟢 (CALL)"
+    elif (last['close'] < last['ema50']) and (last['close'] >= last['bb_upper']) and (last['rsi'] > 65):
+        signal = "SELL 🔴 (PUT)"
+
+    return signal, last['close'], last['rsi']
+
+print(f"✅ บอทเริ่มเฝ้ากราฟ {ASSET} บน Railway แล้ว")
+send_line_message(f"🤖 บอททำงานบน Railway สำเร็จ!\n📊 คู่เงิน: {ASSET}\n⏱ Timeframe: 1 นาที")
+
+last_scan = None
+
+while True:
+    try:
+        now_utc = pd.Timestamp.now(tz="UTC")
+        now_min = now_utc.floor("min")
+
+        if now_utc.second >= 1 and last_scan != now_min:
+            last_scan = now_min
+            prev_min = now_min - pd.Timedelta(minutes=1)
+
+            df = wait_for_candle(ASSET, prev_min)
+            if df is None:
+                continue
+
+            df = df[df.index < now_min]
+            if len(df) < 60:
+                continue
+
+            signal, entry_price, rsi_val = analyze_market(df)
+
+            if signal:
+                time_str = datetime.now(tz_thai).strftime("%H:%M:%S")
+                msg = (
+                    f"🚨 สัญญาณ 1 นาที ({ASSET})\n"
+                    f"⏰ เวลาไทย: {time_str}\n"
+                    f"🎯 แนะนำกด: {signal}\n"
+                    f"💵 ราคาล่าสุด: {entry_price:.5f}\n"
+                    f"📈 RSI: {rsi_val:.1f}\n"
+                    f"⏳ รอสรุปผล..."
+                )
+                print(f"[{time_str}] ส่งสัญญาณ: {signal}")
+                send_line_message(msg)
+
+                target_close = now_min + pd.Timedelta(minutes=1, seconds=5)
+                while pd.Timestamp.now(tz="UTC") < target_close:
+                    time.sleep(0.5)
+
+                res_df = wait_for_candle(ASSET, now_min, timeout=30)
+                if res_df is None:
+                    continue
+
+                eval_c = res_df.loc[now_min]
+                open_p, close_p = float(eval_c['open']), float(eval_c['close'])
+
+                if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
+                    res_txt = "✅ WIN (ชนะ)"
+                    stats["win"] += 1
+                elif close_p == open_p:
+                    res_txt = "⚖️ TIE (เสมอ)"
+                    stats["tie"] += 1
+                else:
+                    res_txt = "❌ LOSS (แพ้)"
+                    stats["loss"] += 1
+
+                total = stats["win"] + stats["loss"]
+                wr = (stats["win"] / total * 100) if total > 0 else 0.0
+
+                res_msg = (
+                    f"🏁 สรุปผล ({ASSET})\n"
+                    f"ผลลัพธ์: {res_txt}\n"
+                    f"🏆 ชนะ {stats['win']} | แพ้ {stats['loss']} | เสมอ {stats['tie']}\n"
+                    f"🔥 Win Rate: {wr:.2f}%"
+                )
+                send_line_message(res_msg)
+        else:
+            time.sleep(0.5)
+    except Exception as e:
+        print(f"⚠️ ระบบสะดุด: {e}")
+        time.sleep(5)
