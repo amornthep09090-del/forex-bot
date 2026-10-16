@@ -17,40 +17,34 @@ if not LINE_SIGNAL_TOKEN or not LINE_RESULT_TOKEN or not LINE_USER_ID:
 
 tz_thai = timezone(timedelta(hours=7))
 
-# เลือกคู่เงินหลักที่เคลื่อนไหวเร็วและ Volume สูงเพื่อให้ติดออเดอร์ง่าย
+# รายชื่อคู่เงินสากลทั้ง 19 คู่
 SYMBOLS = {
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "USDJPY": "USDJPY=X",
+    "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X",
+    "AUDUSD": "AUDUSD=X", "USDCAD": "USDCAD=X", "NZDUSD": "NZDUSD=X",
+    "USDCHF": "USDCHF=X", "EURGBP": "EURGBP=X", "EURJPY": "EURJPY=X",
+    "GBPJPY": "GBPJPY=X", "AUDJPY": "AUDJPY=X", "EURAUD": "EURAUD=X",
+    "EURCAD": "EURCAD=X", "GBPCAD": "GBPCAD=X", "GBPAUD": "GBPAUD=X",
+    "AUDNZD": "AUDNZD=X", "CHFJPY": "CHFJPY=X", "CADJPY": "CADJPY=X",
+    "AUDCAD": "AUDCAD=X",
 }
 
-# ฟังก์ชันส่งข้อความ "จุดเข้า" (บอทสัญญาณ)
+# ระบบสถิติและการเรียนรู้ AI แยกตามคู่เงิน
+stats = {asset: {"win": 0, "loss": 0, "tie": 0, "consecutive_loss": 0, "cooldown_until": 0} for asset in SYMBOLS}
+global_stats = {"win": 0, "loss": 0, "tie": 0}
+
 def send_signal_message(text):
     url = "https://api.line.me/v2/bot/message/push"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_SIGNAL_TOKEN}"
-    }
-    payload = {
-        "to": LINE_USER_ID,
-        "messages": [{"type": "text", "text": text}]
-    }
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LINE_SIGNAL_TOKEN}"}
+    payload = {"to": LINE_USER_ID, "messages": [{"type": "text", "text": text}]}
     try:
         requests.post(url, headers=headers, json=payload, timeout=10)
     except Exception as e:
         print(f"⚠️ Signal Exception: {e}")
 
-# ฟังก์ชันส่งข้อความ "สรุปผล" (บอทผลลัพธ์)
 def send_result_message(text):
     url = "https://api.line.me/v2/bot/message/push"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_RESULT_TOKEN}"
-    }
-    payload = {
-        "to": LINE_USER_ID,
-        "messages": [{"type": "text", "text": text}]
-    }
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LINE_RESULT_TOKEN}"}
+    payload = {"to": LINE_USER_ID, "messages": [{"type": "text", "text": text}]}
     try:
         requests.post(url, headers=headers, json=payload, timeout=10)
     except Exception as e:
@@ -76,16 +70,49 @@ def wait_for_candle(asset, target_time, timeout=20):
         df = get_candles(asset, retries=1)
         if df is not None and target_time in df.index:
             return df
-        time.sleep(3)
+        time.sleep(2)
     return None
 
-print("✅ บอทโหมด 1 นาที 1 ออเดอร์ เริ่มทำงานบน Railway แล้ว")
-send_signal_message("🚀 บอทโหมดซิ่ง (1 นาที 1 ออเดอร์) เริ่มทำงานแล้ว เตรียมรับสัญญาณรัวๆ!")
+def evaluate_asset(df):
+    """คำนวณหาความน่าจะเป็นและให้คะแนนความน่าสนใจของคู่เงินนั้นๆ"""
+    df = df.copy()
+    delta = df["close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=7).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=7).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df["rsi"] = (100 - (100 / (1 + rs))).fillna(50)
+
+    last = df.iloc[-1]
+    rsi_val = last["rsi"]
+    
+    # กำหนดทิศทาง
+    if last["close"] >= last["open"]:
+        signal = "BUY 🟢 (CALL)"
+    else:
+        signal = "SELL 🔴 (PUT)"
+
+    # คำนวณ Score ความมั่นใจ (ยิ่ง RSI ห่างจาก 50 มาก ยิ่งมีความแรงของเทรนด์สูง)
+    confidence_score = abs(rsi_val - 50)
+    return signal, last["close"], rsi_val, confidence_score
+
+print("✅ บอท AI คัดเลือกคู่ที่ดีที่สุด (Best Pick) เริ่มทำงานแล้ว")
+send_signal_message("🤖 AI Smart Picker เริ่มทำงาน! สแกน 19 คู่เงิน คัดตัวที่ดีที่สุดทุกๆ 1 นาที")
 
 last_scan = None
+last_heartbeat = time.time()
 
 while True:
     try:
+        current_time = time.time()
+
+        # รายงานตัวทุก 30 นาที
+        if current_time - last_heartbeat >= 1800:
+            last_heartbeat = current_time
+            time_str = datetime.now(tz_thai).strftime("%H:%M:%S")
+            tot = global_stats["win"] + global_stats["loss"]
+            wr_all = (global_stats["win"] / tot * 100) if tot > 0 else 0.0
+            send_signal_message(f"🟢 บอทยังทำงานปกติ\n⏰ เวลา: {time_str}\n📊 สถิติรวม: ชนะ {global_stats['win']} | แพ้ {global_stats['loss']} (Win Rate: {wr_all:.2f}%)")
+
         now_utc = pd.Timestamp.now(tz="UTC")
         now_min = now_utc.floor("min")
 
@@ -93,53 +120,95 @@ while True:
             last_scan = now_min
             prev_min = now_min - pd.Timedelta(minutes=1)
 
-            # เลือกคู่เงินแรกมาออกออเดอร์ทันทีทุกๆ นาทีเพื่อให้สลับกันทำกำไร
-            asset = "EURUSD"
-            df = wait_for_candle(asset, prev_min, timeout=5)
-            
-            if df is not None and len(df) > 2:
-                last_c = df.iloc[-1]
-                prev_c = df.iloc[-2]
-                
-                # เงื่อนไขแบบออกทุกนาที (ดูทิศทางแท่งเทียนก่อนหน้า)
-                if last_c["close"] >= last_c["open"]:
-                    signal = "BUY 🟢 (CALL)"
-                else:
-                    signal = "SELL 🔴 (PUT)"
+            best_candidate = None
+            highest_score = -1
 
+            # 1. สแกนทั้ง 19 คู่เงินเพื่อหาตัวที่ "ดีที่สุด" ในนาทีนี้
+            for asset in SYMBOLS:
+                if current_time < stats[asset]["cooldown_until"]:
+                    continue
+
+                df = wait_for_candle(asset, prev_min, timeout=3)
+                if df is None:
+                    continue
+
+                df_filtered = df[df.index < now_min]
+                if len(df_filtered) < 10:
+                    continue
+
+                signal, entry_price, rsi_val, score = evaluate_asset(df_filtered)
+
+                # บวกโบนัสคะแนนให้คู่เงินที่มีสถิติชนะสะสมดี
+                s = stats[asset]
+                total_s = s["win"] + s["loss"]
+                win_rate_s = (s["win"] / total_s) if total_s > 0 else 0.5
+                final_score = score * (win_rate_s + 0.5)
+
+                if final_score > highest_score:
+                    highest_score = final_score
+                    best_candidate = {
+                        "asset": asset,
+                        "signal": signal,
+                        "price": entry_price,
+                        "rsi": rsi_val
+                    }
+
+            # 2. ถือว่าได้ตัวที่ดีที่สุดแล้ว ส่งสัญญาณเฉพาะตัวนี้เท่านั้น!
+            if best_candidate:
+                asset = best_candidate["asset"]
+                signal = best_candidate["signal"]
+                entry_price = best_candidate["price"]
+                rsi_val = best_candidate["rsi"]
                 time_str = datetime.now(tz_thai).strftime("%H:%M:%S")
-                
-                # 1. ส่งสัญญาณจุดเข้า
+
                 signal_msg = (
-                    f"🚨 สัญญาณซิ่ง 1 นาที ({asset})\n"
+                    f"🔥 AI Top Pick ({asset})\n"
                     f"⏰ เวลา: {time_str}\n"
                     f"🎯 แนะนำ: {signal}\n"
-                    f"💵 ราคา: {last_c['close']:.5f}"
+                    f"💵 ราคา: {entry_price:.5f}\n"
+                    f"📈 RSI: {rsi_val:.1f}"
                 )
                 send_signal_message(signal_msg)
 
-                # รอผลลัพธ์ของแท่งถัดไป (1 นาทีจบ)
+                # รอจบแท่งเทียน 1 นาทีเพื่อประเมินผล
                 target_close = now_min + pd.Timedelta(minutes=1, seconds=3)
                 while pd.Timestamp.now(tz="UTC") < target_close:
-                    time.sleep(0.5)
+                    time.sleep(0.3)
 
-                res_df = wait_for_candle(asset, now_min, timeout=15)
+                res_df = wait_for_candle(asset, now_min, timeout=12)
                 if res_df is not None and now_min in res_df.index:
                     eval_c = res_df.loc[now_min]
                     open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
 
                     if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
                         res_txt = "✅ WIN (ชนะ)"
+                        stats[asset]["win"] += 1
+                        global_stats["win"] += 1
+                        stats[asset]["consecutive_loss"] = 0
                     elif close_p == open_p:
                         res_txt = "⚖️ TIE (เสมอ)"
+                        stats[asset]["tie"] += 1
+                        global_stats["tie"] += 1
                     else:
                         res_txt = "❌ LOSS (แพ้)"
+                        stats[asset]["loss"] += 1
+                        global_stats["loss"] += 1
+                        stats[asset]["consecutive_loss"] += 1
 
-                    # 2. ส่งผลลัพธ์
+                        # 🧠 AI เรียนรู้ตัวเอง: แพ้ติดกัน 2 ครั้ง พักคู่นี้ 15 นาที
+                        if stats[asset]["consecutive_loss"] >= 2:
+                            stats[asset]["cooldown_until"] = time.time() + 900
+                            send_signal_message(f"🧠 AI Notice: คู่เงิน {asset} แพ้ติดกัน 2 ครั้ง สั่งพักชั่วคราว 15 นาที")
+
+                    s = stats[asset]
+                    total = s["win"] + s["loss"]
+                    wr = (s["win"] / total * 100) if total > 0 else 0.0
+
                     result_msg = (
-                        f"🏁 ผลลัพธ์ 1 นาที ({asset})\n"
+                        f"🏁 ผลลัพธ์ Top Pick ({asset})\n"
                         f"ผล: {res_txt}\n"
-                        f"💵 เปิด: {open_p:.5f} | ปิด: {close_p:.5f}"
+                        f"🏆 ชนะ {s['win']} | แพ้ {s['loss']}\n"
+                        f"🔥 Win Rate คู่นี้: {wr:.2f}%"
                     )
                     send_result_message(result_msg)
 
