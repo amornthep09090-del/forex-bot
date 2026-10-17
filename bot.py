@@ -17,8 +17,9 @@ if not LINE_SIGNAL_TOKEN or not LINE_RESULT_TOKEN or not LINE_USER_ID:
 
 tz_thai = timezone(timedelta(hours=7))
 
-# รายชื่อคู่เงินสากลทั้ง 19 คู่
+# รายชื่อคู่เงินรวมทั้งคู่หลักและคู่ OTC ยอดฮิตในแพลตฟอร์ม
 SYMBOLS = {
+    # คู่หลักสากล
     "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X",
     "AUDUSD": "AUDUSD=X", "USDCAD": "USDCAD=X", "NZDUSD": "NZDUSD=X",
     "USDCHF": "USDCHF=X", "EURGBP": "EURGBP=X", "EURJPY": "EURJPY=X",
@@ -26,6 +27,9 @@ SYMBOLS = {
     "EURCAD": "EURCAD=X", "GBPCAD": "GBPCAD=X", "GBPAUD": "GBPAUD=X",
     "AUDNZD": "AUDNZD=X", "CHFJPY": "CHFJPY=X", "CADJPY": "CADJPY=X",
     "AUDCAD": "AUDCAD=X",
+    # คู่ OTC ยอดนิยม (ใช้ Yahoo Symbol เทียบเคียงโครงสร้างราคา)
+    "EURUSD-OTC": "EURUSD=X", "GBPUSD-OTC": "GBPUSD=X", "USDJPY-OTC": "USDJPY=X",
+    "AUDUSD-OTC": "AUDUSD=X", "EURJPY-OTC": "EURJPY=X", "GBPJPY-OTC": "GBPJPY=X"
 }
 
 stats = {asset: {"win": 0, "loss": 0, "tie": 0, "consecutive_loss": 0, "cooldown_until": 0} for asset in SYMBOLS}
@@ -48,18 +52,6 @@ def send_result_message(text):
         requests.post(url, headers=headers, json=payload, timeout=10)
     except Exception as e:
         print(f"⚠️ Result Exception: {e}")
-
-def is_market_open():
-    now_utc = datetime.now(timezone.utc)
-    weekday = now_utc.weekday()
-    hour = now_utc.hour
-    if weekday == 5:
-        return False
-    if weekday == 6 and hour < 22:
-        return False
-    if weekday == 4 and hour >= 22:
-        return False
-    return True
 
 def get_candles(asset, retries=3):
     for _ in range(retries):
@@ -104,8 +96,8 @@ def analyze_market_with_score(df):
 
     return signal, last["close"], rsi_val, score
 
-print("✅ บอทโหมดคัดเลือก 5 คู่เงินเด่น (เปลี่ยนทุกเที่ยง/เที่ยงคืน) เริ่มทำงานแล้ว")
-send_signal_message("🤖 AI 5-Asset Picker พร้อม! บอทจะคัด 5 คู่เงินที่ดีที่สุดมาให้ และอัปเดตใหม่ทุกๆ เที่ยงวันและเที่ยงคืน")
+print("✅ บอทโหมดรองรับคู่ OTC พร้อมสลับ 5 คู่เด่น เริ่มทำงานแล้ว")
+send_signal_message("🤖 AI OTC & Standard Picker พร้อม! รองรับคู่ OTC และสลับ 5 คู่เด่นทุกเที่ยงวัน/เที่ยงคืน")
 
 current_target_assets = []
 last_session_check = None
@@ -115,9 +107,7 @@ last_heartbeat = time.time()
 pending_signal = None
 
 def select_top_5_assets():
-    """สแกนและจัดอันดับเลือก 5 คู่เงินที่มีความผันผวนและเทรนด์น่าสนใจที่สุดในช่วงเวลานั้น"""
     asset_scores = []
-
     for asset in SYMBOLS:
         df = get_candles(asset, retries=2)
         if df is None or len(df) < 25:
@@ -136,13 +126,11 @@ def select_top_5_assets():
 
         asset_scores.append((asset, score))
 
-    # เรียงลำดับจากคะแนนมากไปน้อย แล้วเลือกเอา 5 อันดับแรก
     asset_scores.sort(key=lambda x: x[1], reverse=True)
     top_5 = [item[0] for item in asset_scores[:5]]
     
-    # หากดึงไม่ครบ ให้ใส่ค่าสำรอง
     if len(top_5) < 5:
-        top_5 = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"]
+        top_5 = ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "EURUSD", "GBPUSD"]
 
     return top_5
 
@@ -154,19 +142,15 @@ while True:
 
         session_id = f"{now_thai.strftime('%Y-%m-%d')}-{'AM' if hour < 12 else 'PM'}"
 
-        if not is_market_open():
-            time.sleep(60)
-            continue
-
-        # เปลี่ยนรอบทุกๆ เที่ยงคืน (00:00) และเที่ยงวัน (12:00)
+        # เปลี่ยนรอบทุกๆ เที่ยงคืน (00:00) และเที่ยงวัน (12:00) โดยรองรับคู่ OTC จึงไม่ต้องเช็กวันหยุดตลาดปิด
         if last_session_check != session_id:
             last_session_check = session_id
-            send_signal_message(f"🔄 กำลังวิเคราะห์ตลาดเพื่อคัดเลือก 5 คู่เงินเด่นประจำรอบ ({'รอบบ่าย/ค่ำ' if hour >= 12 else 'รอบเช้า/ดึก'})... รอสักครู่")
+            send_signal_message(f"🔄 กำลังวิเคราะห์ตลาดเพื่อคัดเลือก 5 คู่เงินเด่น (รวม OTC) ประจำรอบ...")
             current_target_assets = select_top_5_assets()
             
             assets_str = ", ".join(current_target_assets)
             send_signal_message(
-                f"🏆 ประกาศ 5 คู่เงินเด่นประจำรอบใหม่!\n"
+                f"🏆 ประกาศ 5 คู่เงินเด่น (รวม OTC) ประจำรอบใหม่!\n"
                 f"📅 ช่วงเวลา: {session_id}\n"
                 f"🎯 5 คู่ที่แนะนำให้โฟกัส: **{assets_str}**\n"
                 f"💡 บอทจะสแกนเฉพาะ 5 คู่นี้วนไปจนกว่าจะถึงรอบถัดไป (12:00 / 00:00)"
@@ -177,13 +161,13 @@ while True:
             last_heartbeat = current_time
             tot = global_stats["win"] + global_stats["loss"]
             wr_all = (global_stats["win"] / tot * 100) if tot > 0 else 0.0
-            send_signal_message(f"🟢 บอทยังเฝ้า 5 คู่เด่นปกติ\n📊 สถิติรวม: ชนะ {global_stats['win']} | แพ้ {global_stats['loss']} (Win Rate: {wr_all:.2f}%)")
+            send_signal_message(f"🟢 บอทยังเฝ้า 5 คู่เด่น (รวม OTC) ปกติ\n📊 สถิติรวม: ชนะ {global_stats['win']} | แพ้ {global_stats['loss']} (Win Rate: {wr_all:.2f}%)")
 
         now_utc = pd.Timestamp.now(tz="UTC")
         current_min = now_utc.floor("min")
         current_sec = now_utc.second
 
-        # 1. วินาทีที่ 50: สแกนล่วงหน้า (Pre-Signal) เฉพาะในกลุ่ม 5 คู่เงินเด่นประจำรอบ
+        # 1. วินาทีที่ 50: สแกนล่วงหน้า (Pre-Signal)
         if current_sec >= 50 and last_pre_scan != current_min:
             last_pre_scan = current_min
             pending_signal = None
@@ -261,7 +245,6 @@ while True:
                         global_stats["loss"] += 1
                         stats[asset]["consecutive_loss"] += 1
 
-                        # แพ้ 2 ไม้ติด พัก 30 นาทีเฉพาะคู่นี้
                         if stats[asset]["consecutive_loss"] >= 2:
                             stats[asset]["cooldown_until"] = time.time() + 1800
                             send_signal_message(f"🧠 AI Notice: คู่เงิน {asset} แพ้ติดกัน 2 ไม้ติด! สั่งพักการเทรด 30 นาที")
