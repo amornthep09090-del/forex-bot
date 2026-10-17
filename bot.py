@@ -6,18 +6,16 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
-# ดึงค่า Discord Webhook ทั้ง 3 ห้องจาก Railway Variables
 DISCORD_MAIN_WEBHOOK = os.getenv("DISCORD_MAIN_WEBHOOK", "").strip()
 DISCORD_OTC_WEBHOOK = os.getenv("DISCORD_OTC_WEBHOOK", "").strip()
 DISCORD_RESULT_WEBHOOK = os.getenv("DISCORD_RESULT_WEBHOOK", "").strip()
 
 if not DISCORD_MAIN_WEBHOOK or not DISCORD_OTC_WEBHOOK or not DISCORD_RESULT_WEBHOOK:
-    print("❌ กรุณาตั้งค่า Webhook ให้ครบทั้ง 3 ช่อง (Main, OTC, Result) ใน Railway Variables")
+    print("❌ กรุณาตั้งค่า Webhook ให้ครบทั้ง 3 ช่องใน Railway Variables")
     exit(1)
 
 tz_thai = timezone(timedelta(hours=7))
 
-# รายการคู่เงินหลักทั้งหมด (Standard)
 STANDARD_SYMBOLS = {
     "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X",
     "AUDUSD": "AUDUSD=X", "USDCAD": "USDCAD=X", "NZDUSD": "NZDUSD=X",
@@ -28,7 +26,6 @@ STANDARD_SYMBOLS = {
     "AUDCAD": "AUDCAD=X"
 }
 
-# รายการคู่ OTC ทั้งหมด
 OTC_SYMBOLS = {
     "EURUSD-OTC": "EURUSD=X", "GBPUSD-OTC": "GBPUSD=X", "USDJPY-OTC": "USDJPY=X",
     "AUDUSD-OTC": "AUDUSD=X", "EURJPY-OTC": "EURJPY=X", "GBPJPY-OTC": "GBPJPY=X",
@@ -63,19 +60,21 @@ def send_result_message(text):
 def get_candles(symbol_code, retries=3):
     for _ in range(retries):
         try:
-            df = yf.Ticker(symbol_code).history(period="5d", interval="1m")
+            df = yf.Ticker(symbol_code).history(period="3d", interval="1m")
             if df is not None and not df.empty:
                 df = df.rename(columns=str.lower)
                 idx = df.index
                 df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
-                return df[["open", "high", "low", "close"]].astype(float)
+                df = df[["open", "high", "low", "close"]].astype(float)
+                if len(df) >= 15:
+                    return df
         except Exception:
             pass
-        time.sleep(1.5)
+        time.sleep(1)
     return None
 
 def analyze_market_flexible(df):
-    if len(df) < 20:
+    if df is None or len(df) < 20:
         return None, 0, 0, 0
     df = df.copy()
     delta = df["close"].diff()
@@ -90,7 +89,7 @@ def analyze_market_flexible(df):
     df["bb_lower"] = df["sma20"] - (df["std20"] * 1.7)
 
     last = df.iloc[-1]
-    rsi_val = last["rsi"]
+    rsi_val = float(last["rsi"])
     signal = None
     score = 0
 
@@ -101,12 +100,12 @@ def analyze_market_flexible(df):
         signal = "SELL 🔴 (PUT)"
         score = abs(rsi_val - 62) + 1
 
-    return signal, last["close"], rsi_val, score
+    return signal, float(last["close"]), rsi_val, score
 
-print("✅ บอทสแกนทุกคู่เงิน (แยก 3 ห้อง Main, OTC, Result) เริ่มทำงานแล้ว")
-send_main_message("🌐 **Main Market Bot เชื่อมต่อสำเร็จ!** ห้องนี้สแกนและส่งสัญญาณคู่เงินหลัก (Standard)")
-send_otc_message("📊 **OTC Market Bot เชื่อมต่อสำเร็จ!** ห้องนี้สแกนและส่งสัญญาณคู่เงิน OTC ทั้งหมด")
-send_result_message("🏆 **Global Statistics Bot เชื่อมต่อสำเร็จ!** ห้องนี้รวบรวมผลแพ้ชนะ สถิติรวม และคำแนะนำการทบไม้")
+print("✅ บอทปรับแต่งรูปแบบข้อความให้อ่านง่าย เริ่มทำงานแล้ว")
+send_main_message("🌐 **Main Market Bot พร้อมทำงาน!** (ห้องสแกนคู่เงินหลัก)")
+send_otc_message("📊 **OTC Market Bot พร้อมทำงาน!** (ห้องสแกนคู่ OTC)")
+send_result_message("🏆 **Global Statistics Bot พร้อมทำงาน!** (ห้องสรุปผลสถิติรวม)")
 
 last_pre_scan = None
 last_action_min = None
@@ -125,69 +124,76 @@ while True:
             last_pre_scan = current_min
             pending_signals = {"MAIN": None, "OTC": None}
 
-            # สแกนหาคู่หลักที่ดีที่สุด
             best_std_score = -1
             for asset, code in STANDARD_SYMBOLS.items():
                 if current_time < stats[asset]["cooldown_until"]:
                     continue
                 df = get_candles(code, retries=1)
-                if df is None or len(df) < 20:
-                    continue
                 signal, entry_price, rsi_val, score = analyze_market_flexible(df)
                 if signal and score > best_std_score:
                     best_std_score = score
                     pending_signals["MAIN"] = {"asset": asset, "signal": signal, "price": entry_price, "rsi": rsi_val}
 
-            # สแกนหาคู่ OTC ที่ดีที่สุด
             best_otc_score = -1
             for asset, code in OTC_SYMBOLS.items():
                 if current_time < stats[asset]["cooldown_until"]:
                     continue
                 df = get_candles(code, retries=1)
-                if df is None or len(df) < 20:
-                    continue
                 signal, entry_price, rsi_val, score = analyze_market_flexible(df)
                 if signal and score > best_otc_score:
                     best_otc_score = score
                     pending_signals["OTC"] = {"asset": asset, "signal": signal, "price": entry_price, "rsi": rsi_val}
 
             pre_time_str = (now_thai + timedelta(minutes=1)).strftime("%H:%M")
+            
             if pending_signals["MAIN"]:
                 p_std = pending_signals["MAIN"]
                 send_main_message(
                     f"⏳ **[Main Pre-Signal] เตรียมตัว!**\n"
-                    f"🎯 เล็งคู่: `{p_std['asset']}` | ทิศทาง: {p_std['signal']}\n"
-                    f"⏰ กดตอนเวลา **{pre_time_str}** น."
+                    f"----------------------------------------\n"
+                    f"🎯 คู่เงิน: `{p_std['asset']}`\n"
+                    f"📊 ทิศทาง: {p_std['signal']}\n"
+                    f"⏰ เตรียมกดตอนเวลา: **{pre_time_str}** น.\n"
+                    f"----------------------------------------"
                 )
+                
             if pending_signals["OTC"]:
                 p_otc = pending_signals["OTC"]
                 send_otc_message(
                     f"⏳ **[OTC Pre-Signal] เตรียมตัว!**\n"
-                    f"🎯 เล็งคู่: `{p_otc['asset']}` | ทิศทาง: {p_otc['signal']}\n"
-                    f"⏰ กดตอนเวลา **{pre_time_str}** น."
+                    f"----------------------------------------\n"
+                    f"🎯 คู่เงิน: `{p_otc['asset']}`\n"
+                    f"📊 ทิศทาง: {p_otc['signal']}\n"
+                    f"⏰ เตรียมกดตอนเวลา: **{pre_time_str}** น.\n"
+                    f"----------------------------------------"
                 )
 
-        # 2. วินาทีที่ 1: ส่งสัญญาณจริงและประเมินผลส่งเข้าห้องสถิติต่างหาก
+        # 2. วินาทีที่ 1: ส่งสัญญาณจริงและประเมินผล
         if current_sec >= 1 and last_action_min != current_min:
             last_action_min = current_min
             time_str = now_thai.strftime("%H:%M:%S")
 
-            # ประมวลผลฝั่งคู่เงินหลัก (Main)
+            # ประมวลผล Main
             if pending_signals["MAIN"]:
                 p_std = pending_signals["MAIN"]
                 asset = p_std["asset"]
                 signal = p_std["signal"]
                 
                 msg = (
-                    f"🚨 **[Main] ลุยเลย! เปิดออเดอร์** (`{asset}`)\n"
-                    f"⏰ เวลา: {time_str} | ทิศทาง: {signal}\n"
-                    f"💵 ราคา: `{p_std['price']:.5f}` | RSI: `{p_std['rsi']:.1f}`"
+                    f"🚨 **[Main] ลุยเลย! เปิดออเดอร์**\n"
+                    f"----------------------------------------\n"
+                    f"🎯 คู่เงิน: `{asset}`\n"
+                    f"⏰ เวลา: `{time_str}`\n"
+                    f"📈 ทิศทาง: {signal}\n"
+                    f"💵 ราคาเปิด: `{p_std['price']:.5f}`\n"
+                    f"📉 ค่า RSI: `{p_std['rsi']:.1f}`"
                 )
                 if last_result_type["MAIN"] == "LOSS":
-                    msg += f"\n💡 *AI Tip: ไม้หลักที่แล้วแพ้ พิจารณา **ทบไม้ (Martingale x2)***"
+                    msg += f"\n\n💡 *AI Tip: ไม้หลักที่แล้วแพ้ พิจารณา **ทบไม้ (Martingale x2)***"
+                msg += f"\n----------------------------------------"
                 send_main_message(msg)
 
-                target_close = current_min + pd.Timedelta(minutes=1, seconds=3)
+                target_close = current_min + pd.Timedelta(minutes=1, seconds=5)
                 while pd.Timestamp.now(tz="UTC") < target_close:
                     time.sleep(0.3)
 
@@ -224,36 +230,41 @@ while True:
                     s = stats[asset]
                     tot = s["win"] + s["loss"]
                     wr = (s["win"] / tot * 100) if tot > 0 else 0.0
-                    
                     tot_global = global_stats["win"] + global_stats["loss"]
                     wr_global = (global_stats["win"] / tot_global * 100) if tot_global > 0 else 0.0
 
                     send_result_message(
-                        f"📊 **[Main Result]** (`{asset}`)\n"
+                        f"📊 **[Main Result Report]**\n"
                         f"----------------------------------------\n"
+                        f"🎯 คู่เงิน: `{asset}`\n"
                         f"📌 ผลลัพธ์: {res_txt}\n"
-                        f"💬 **คำแนะนำ**: {advice}\n"
-                        f"📈 **สถิติคู่ `{asset}`**: ชนะ `{s['win']}` | แพ้ `{s['loss']}` (Win Rate: `{wr:.2f}%`)\n"
-                        f"🌐 **สถิติภาพรวมทั้งหมด**: ชนะ `{global_stats['win']}` | แพ้ `{global_stats['loss']}` (Win Rate รวม: `{wr_global:.2f}%`)\n"
+                        f"💬 คำแนะนำ: {advice}\n"
+                        f"📈 สถิติคู่ `{asset}`: ชนะ `{s['win']}` | แพ้ `{s['loss']}` (Win Rate: `{wr:.2f}%`)\n"
+                        f"🌐 สถิติภาพรวมทั้งหมด: ชนะ `{global_stats['win']}` | แพ้ `{global_stats['loss']}` (Win Rate รวม: `{wr_global:.2f}%`)\n"
                         f"----------------------------------------"
                     )
 
-            # ประมวลผลฝั่งคู่ OTC
+            # ประมวลผล OTC
             if pending_signals["OTC"]:
                 p_otc = pending_signals["OTC"]
                 asset = p_otc["asset"]
                 signal = p_otc["signal"]
                 
                 msg = (
-                    f"🚨 **[OTC] ลุยเลย! เปิดออเดอร์** (`{asset}`)\n"
-                    f"⏰ เวลา: {time_str} | ทิศทาง: {signal}\n"
-                    f"💵 ราคา: `{p_otc['price']:.5f}` | RSI: `{p_otc['rsi']:.1f}`"
+                    f"🚨 **[OTC] ลุยเลย! เปิดออเดอร์**\n"
+                    f"----------------------------------------\n"
+                    f"🎯 คู่เงิน: `{asset}`\n"
+                    f"⏰ เวลา: `{time_str}`\n"
+                    f"📈 ทิศทาง: {signal}\n"
+                    f"💵 ราคาเปิด: `{p_otc['price']:.5f}`\n"
+                    f"📉 ค่า RSI: `{p_otc['rsi']:.1f}`"
                 )
                 if last_result_type["OTC"] == "LOSS":
-                    msg += f"\n💡 *AI Tip: ไม้ OTC ที่แล้วแพ้ พิจารณา **ทบไม้ (Martingale x2)***"
+                    msg += f"\n\n💡 *AI Tip: ไม้ OTC ที่แล้วแพ้ พิจารณา **ทบไม้ (Martingale x2)***"
+                msg += f"\n----------------------------------------"
                 send_otc_message(msg)
 
-                target_close = current_min + pd.Timedelta(minutes=1, seconds=3)
+                target_close = current_min + pd.Timedelta(minutes=1, seconds=5)
                 while pd.Timestamp.now(tz="UTC") < target_close:
                     time.sleep(0.3)
 
@@ -290,17 +301,17 @@ while True:
                     s = stats[asset]
                     tot = s["win"] + s["loss"]
                     wr = (s["win"] / tot * 100) if tot > 0 else 0.0
-                    
                     tot_global = global_stats["win"] + global_stats["loss"]
                     wr_global = (global_stats["win"] / tot_global * 100) if tot_global > 0 else 0.0
 
                     send_result_message(
-                        f"📊 **[OTC Result]** (`{asset}`)\n"
+                        f"📊 **[OTC Result Report]**\n"
                         f"----------------------------------------\n"
+                        f"🎯 คู่เงิน: `{asset}`\n"
                         f"📌 ผลลัพธ์: {res_txt}\n"
-                        f"💬 **คำแนะนำ**: {advice}\n"
-                        f"📈 **สถิติคู่ `{asset}`**: ชนะ `{s['win']}` | แพ้ `{s['loss']}` (Win Rate: `{wr:.2f}%`)\n"
-                        f"🌐 **สถิติภาพรวมทั้งหมด**: ชนะ `{global_stats['win']}` | แพ้ `{global_stats['loss']}` (Win Rate รวม: `{wr_global:.2f}%`)\n"
+                        f"💬 คำแนะนำ: {advice}\n"
+                        f"📈 สถิติคู่ `{asset}`: ชนะ `{s['win']}` | แพ้ `{s['loss']}` (Win Rate: `{wr:.2f}%`)\n"
+                        f"🌐 สถิติภาพรวมทั้งหมด: ชนะ `{global_stats['win']}` | แพ้ `{global_stats['loss']}` (Win Rate รวม: `{wr_global:.2f}%`)\n"
                         f"----------------------------------------"
                     )
 
