@@ -57,24 +57,24 @@ def send_result_message(text):
     except Exception as e:
         print(f"⚠️ Result Webhook Error: {e}")
 
-def get_candles(symbol_code, retries=3):
+def get_candles(symbol_code, retries=4):
     for _ in range(retries):
         try:
-            df = yf.Ticker(symbol_code).history(period="3d", interval="1m")
+            df = yf.Ticker(symbol_code).history(period="2d", interval="1m")
             if df is not None and not df.empty:
                 df = df.rename(columns=str.lower)
                 idx = df.index
                 df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
                 df = df[["open", "high", "low", "close"]].astype(float)
-                if len(df) >= 15:
+                if len(df) >= 10:
                     return df
         except Exception:
             pass
-        time.sleep(1)
+        time.sleep(1.5)
     return None
 
 def analyze_market_flexible(df):
-    if df is None or len(df) < 20:
+    if df is None or len(df) < 15:
         return None, 0, 0, 0
     df = df.copy()
     delta = df["close"].diff()
@@ -83,10 +83,10 @@ def analyze_market_flexible(df):
     rs = gain / loss.replace(0, np.nan)
     df["rsi"] = (100 - (100 / (1 + rs))).fillna(50)
 
-    df["sma20"] = df["close"].rolling(window=20).mean()
-    df["std20"] = df["close"].rolling(window=20).std()
-    df["bb_upper"] = df["sma20"] + (df["std20"] * 1.7)
-    df["bb_lower"] = df["sma20"] - (df["std20"] * 1.7)
+    df["sma20"] = df["close"].rolling(window=15).mean()
+    df["std20"] = df["close"].rolling(window=15).std()
+    df["bb_upper"] = df["sma20"] + (df["std20"] * 1.6)
+    df["bb_lower"] = df["sma20"] - (df["std20"] * 1.6)
 
     last = df.iloc[-1]
     rsi_val = float(last["rsi"])
@@ -102,10 +102,10 @@ def analyze_market_flexible(df):
 
     return signal, float(last["close"]), rsi_val, score
 
-print("✅ บอทปรับแต่งรูปแบบข้อความให้อ่านง่าย เริ่มทำงานแล้ว")
-send_main_message("🌐 **Main Market Bot พร้อมทำงาน!** (ห้องสแกนคู่เงินหลัก)")
-send_otc_message("📊 **OTC Market Bot พร้อมทำงาน!** (ห้องสแกนคู่ OTC)")
-send_result_message("🏆 **Global Statistics Bot พร้อมทำงาน!** (ห้องสรุปผลสถิติรวม)")
+print("✅ บอทแก้ไขระบบซิงค์เวลาและรายงานผล เริ่มทำงานแล้ว")
+send_main_message("🌐 **Main Market Bot รีสตาร์ทแก้บั๊กสำเร็จ!**")
+send_otc_message("📊 **OTC Market Bot รีสตาร์ทแก้บั๊กสำเร็จ!**")
+send_result_message("🏆 **Global Statistics Bot พร้อมรายงานผล WIN/LOSS แล้ว!**")
 
 last_pre_scan = None
 last_action_min = None
@@ -171,19 +171,20 @@ while True:
         # 2. วินาทีที่ 1: ส่งสัญญาณจริงและประเมินผล
         if current_sec >= 1 and last_action_min != current_min:
             last_action_min = current_min
-            time_str = now_thai.strftime("%H:%M:%S")
+            action_time_str = now_thai.strftime("%H:%M:%S")
 
             # ประมวลผล Main
             if pending_signals["MAIN"]:
                 p_std = pending_signals["MAIN"]
                 asset = p_std["asset"]
                 signal = p_std["signal"]
+                signal_min = current_min
                 
                 msg = (
                     f"🚨 **[Main] ลุยเลย! เปิดออเดอร์**\n"
                     f"----------------------------------------\n"
                     f"🎯 คู่เงิน: `{asset}`\n"
-                    f"⏰ เวลา: `{time_str}`\n"
+                    f"⏰ เวลา: `{action_time_str}`\n"
                     f"📈 ทิศทาง: {signal}\n"
                     f"💵 ราคาเปิด: `{p_std['price']:.5f}`\n"
                     f"📉 ค่า RSI: `{p_std['rsi']:.1f}`"
@@ -193,13 +194,14 @@ while True:
                 msg += f"\n----------------------------------------"
                 send_main_message(msg)
 
-                target_close = current_min + pd.Timedelta(minutes=1, seconds=5)
+                # รอให้แท่งเทียนวิ่งจบและข้อมูลอัปเดต (ประมาณ 65 วินาที)
+                target_close = signal_min + pd.Timedelta(minutes=1, seconds=62)
                 while pd.Timestamp.now(tz="UTC") < target_close:
-                    time.sleep(0.3)
+                    time.sleep(0.5)
 
-                res_df = get_candles(STANDARD_SYMBOLS[asset], retries=3)
-                if res_df is not None and current_min in res_df.index:
-                    eval_c = res_df.loc[current_min]
+                res_df = get_candles(STANDARD_SYMBOLS[asset], retries=4)
+                if res_df is not None and signal_min in res_df.index:
+                    eval_c = res_df.loc[signal_min]
                     open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
 
                     if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
@@ -249,12 +251,13 @@ while True:
                 p_otc = pending_signals["OTC"]
                 asset = p_otc["asset"]
                 signal = p_otc["signal"]
+                signal_min = current_min
                 
                 msg = (
                     f"🚨 **[OTC] ลุยเลย! เปิดออเดอร์**\n"
                     f"----------------------------------------\n"
                     f"🎯 คู่เงิน: `{asset}`\n"
-                    f"⏰ เวลา: `{time_str}`\n"
+                    f"⏰ เวลา: `{action_time_str}`\n"
                     f"📈 ทิศทาง: {signal}\n"
                     f"💵 ราคาเปิด: `{p_otc['price']:.5f}`\n"
                     f"📉 ค่า RSI: `{p_otc['rsi']:.1f}`"
@@ -264,13 +267,13 @@ while True:
                 msg += f"\n----------------------------------------"
                 send_otc_message(msg)
 
-                target_close = current_min + pd.Timedelta(minutes=1, seconds=5)
+                target_close = signal_min + pd.Timedelta(minutes=1, seconds=62)
                 while pd.Timestamp.now(tz="UTC") < target_close:
-                    time.sleep(0.3)
+                    time.sleep(0.5)
 
-                res_df = get_candles(OTC_SYMBOLS[asset], retries=3)
-                if res_df is not None and current_min in res_df.index:
-                    eval_c = res_df.loc[current_min]
+                res_df = get_candles(OTC_SYMBOLS[asset], retries=4)
+                if res_df is not None and signal_min in res_df.index:
+                    eval_c = res_df.loc[signal_min]
                     open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
 
                     if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
