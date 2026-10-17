@@ -6,38 +6,38 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
-# ดึงค่า Discord Webhook URL ทั้ง 3 ห้องจาก Railway Variables
+# ดึงค่า Discord Webhook 2 ช่องหลัก
 DISCORD_SIGNAL_WEBHOOK = os.getenv("DISCORD_SIGNAL_WEBHOOK", "").strip()
 DISCORD_RESULT_WEBHOOK = os.getenv("DISCORD_RESULT_WEBHOOK", "").strip()
-DISCORD_CONTROL_WEBHOOK = os.getenv("DISCORD_CONTROL_WEBHOOK", "").strip()
 
-if not DISCORD_SIGNAL_WEBHOOK or not DISCORD_RESULT_WEBHOOK or not DISCORD_CONTROL_WEBHOOK:
-    print("❌ กรุณาตั้งค่า Webhook ให้ครบทั้ง 3 ช่อง (Signal, Result, Control) ใน Railway Variables")
+if not DISCORD_SIGNAL_WEBHOOK or not DISCORD_RESULT_WEBHOOK:
+    print("❌ กรุณาตั้งค่า DISCORD_SIGNAL_WEBHOOK และ DISCORD_RESULT_WEBHOOK ใน Railway Variables")
     exit(1)
 
 tz_thai = timezone(timedelta(hours=7))
 
-# ตัวแปรควบคุมสถานะการทำงาน (สามารถสั่งเปลี่ยนผ่านคำสั่งใน Discord ได้)
-BOT_SETTINGS = {
-    "mode": "LIVE",          # "LIVE" (เทรดจริง) หรือ "PAPER" (ทดลองเทรด)
-    "active": True           # True (เปิดทำงาน) หรือ False (ปิดการทำงานชั่วคราว)
-}
-
-# รายชื่อคู่เงินรวมทั้งคู่หลักและคู่ OTC ยอดฮิตในแพลตฟอร์ม
-SYMBOLS = {
+# แยกหมวดหมู่: OTC 5 คู่ + คู่ธรรมดา (Standard) 1 คู่
+STANDARD_SYMBOLS = {
     "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X",
     "AUDUSD": "AUDUSD=X", "USDCAD": "USDCAD=X", "NZDUSD": "NZDUSD=X",
     "USDCHF": "USDCHF=X", "EURGBP": "EURGBP=X", "EURJPY": "EURJPY=X",
     "GBPJPY": "GBPJPY=X", "AUDJPY": "AUDJPY=X", "EURAUD": "EURAUD=X",
     "EURCAD": "EURCAD=X", "GBPCAD": "GBPCAD=X", "GBPAUD": "GBPAUD=X",
     "AUDNZD": "AUDNZD=X", "CHFJPY": "CHFJPY=X", "CADJPY": "CADJPY=X",
-    "AUDCAD": "AUDCAD=X",
-    "EURUSD-OTC": "EURUSD=X", "GBPUSD-OTC": "GBPUSD=X", "USDJPY-OTC": "USDJPY=X",
-    "AUDUSD-OTC": "AUDUSD=X", "EURJPY-OTC": "EURJPY=X", "GBPJPY-OTC": "GBPJPY=X"
+    "AUDCAD": "AUDCAD=X"
 }
 
-stats = {asset: {"win": 0, "loss": 0, "tie": 0, "consecutive_loss": 0, "cooldown_until": 0} for asset in SYMBOLS}
+OTC_SYMBOLS = {
+    "EURUSD-OTC": "EURUSD=X", "GBPUSD-OTC": "GBPUSD=X", "USDJPY-OTC": "USDJPY=X",
+    "AUDUSD-OTC": "AUDUSD=X", "EURJPY-OTC": "EURJPY=X", "GBPJPY-OTC": "GBPJPY=X",
+    "USDCAD-OTC": "USDCAD=X", "AUDCAD-OTC": "AUDCAD=X", "NZDUSD-OTC": "NZDUSD=X"
+}
+
+ALL_SYMBOLS = {**STANDARD_SYMBOLS, **OTC_SYMBOLS}
+
+stats = {asset: {"win": 0, "loss": 0, "tie": 0, "consecutive_loss": 0, "cooldown_until": 0} for asset in ALL_SYMBOLS}
 global_stats = {"win": 0, "loss": 0, "tie": 0}
+last_market_result = "WIN" # ใช้เก็บสถานะไม้ก่อนหน้าเพื่อวิเคราะห์การทบไม้
 
 def send_signal_message(text):
     try:
@@ -51,16 +51,10 @@ def send_result_message(text):
     except Exception as e:
         print(f"⚠️ Result Webhook Error: {e}")
 
-def send_control_message(text):
-    try:
-        requests.post(DISCORD_CONTROL_WEBHOOK, json={"content": text}, timeout=10)
-    except Exception as e:
-        print(f"⚠️ Control Webhook Error: {e}")
-
-def get_candles(asset, retries=3):
+def get_candles(symbol_code, retries=3):
     for _ in range(retries):
         try:
-            df = yf.Ticker(SYMBOLS[asset]).history(period="5d", interval="1m")
+            df = yf.Ticker(symbol_code).history(period="5d", interval="1m")
             if df is not None and not df.empty:
                 df = df.rename(columns=str.lower)
                 idx = df.index
@@ -71,8 +65,11 @@ def get_candles(asset, retries=3):
         time.sleep(1.5)
     return None
 
-def analyze_market_with_score(df):
-    if len(df) < 25:
+def analyze_market_flexible(df):
+    """
+    วิเคราะห์แบบยืดหยุ่น: ไม่ต้องรออินดิเคเตอร์ครบ ขอแค่ RSI หลุดโซน หรือราคาแตะกรอบ ก็สามารถออกออเดอร์ได้เลย
+    """
+    if len(df) < 20:
         return None, 0, 0, 0
     df = df.copy()
     delta = df["close"].diff()
@@ -83,33 +80,27 @@ def analyze_market_with_score(df):
 
     df["sma20"] = df["close"].rolling(window=20).mean()
     df["std20"] = df["close"].rolling(window=20).std()
-    df["bb_upper"] = df["sma20"] + (df["std20"] * 1.8)
-    df["bb_lower"] = df["sma20"] - (df["std20"] * 1.8)
+    df["bb_upper"] = df["sma20"] + (df["std20"] * 1.7)
+    df["bb_lower"] = df["sma20"] - (df["std20"] * 1.7)
 
     last = df.iloc[-1]
     rsi_val = last["rsi"]
     signal = None
     score = 0
 
-    if (last["close"] <= last["bb_lower"]) and (rsi_val < 32):
+    # เงื่อนไขแบบผ่อนปรน (ออกออเดอร์ง่ายขึ้น ไม่ต้องรอเงื่อนไขแน่นเกินไป)
+    if (last["close"] <= last["bb_lower"]) or (rsi_val < 38):
         signal = "BUY 🟢 (CALL)"
-        score = (32 - rsi_val) + abs(last["bb_lower"] - last["close"]) * 1000
-    elif (last["close"] >= last["bb_upper"]) and (rsi_val > 68):
+        score = abs(38 - rsi_val) + 1
+    elif (last["close"] >= last["bb_upper"]) or (rsi_val > 62):
         signal = "SELL 🔴 (PUT)"
-        score = (rsi_val - 68) + abs(last["close"] - last["bb_upper"]) * 1000
+        score = abs(rsi_val - 62) + 1
 
     return signal, last["close"], rsi_val, score
 
-print("✅ บอทโหมดควบคุมผ่าน Discord เริ่มทำงานแล้ว")
-send_control_message(
-    "🎮 **AI Control Center พร้อมทำงาน!**\n"
-    "สามารถพิมพ์คำสั่งควบคุมบอทได้ที่ห้องนี้:\n"
-    "• `!bot on` = เปิดการทำงานบอท\n"
-    "• `!bot off` = ปิดการทำงานบอทชั่วคราว\n"
-    "• `!bot live` = เปลี่ยนเป็นโหมดเทรดจริง\n"
-    "• `!bot paper` = เปลี่ยนเป็นโหมดทดลองเทรด\n"
-    "• `!status` = ตรวจสอบสถานะปัจจุบัน"
-)
+print("✅ บอทโหมดอิสระ วิเคราะห์เอง และแนะนำการทบไม้ เริ่มทำงานแล้ว")
+send_signal_message("🤖 **AI Autonomous Bot เชื่อมต่อสำเร็จ!** พร้อมวิเคราะห์กราฟแบบยืดหยุ่นและลุยตลาดอัตโนมัติ")
+send_result_message("📊 **AI Statistics & Martingale Advisor พร้อมทำงาน!** ห้องนี้จะสรุปผลและให้คำแนะนำเรื่องการทบไม้")
 
 current_target_assets = []
 last_session_check = None
@@ -117,62 +108,57 @@ last_pre_scan = None
 last_action_min = None
 pending_signal = None
 
-def select_top_5_assets():
-    asset_scores = []
-    for asset in SYMBOLS:
-        df = get_candles(asset, retries=2)
-        if df is None or len(df) < 25:
+def select_top_assets():
+    otc_scores = []
+    for asset, code in OTC_SYMBOLS.items():
+        df = get_candles(code, retries=2)
+        if df is None or len(df) < 20:
             continue
-        
-        df_sub = df.tail(50)
-        delta = df_sub["close"].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=7).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=7).mean()
-        rs = gain / loss.replace(0, np.nan)
-        rsi = 100 - (100 / (1 + rs))
-        
-        volatility = df_sub["close"].std()
-        avg_rsi_deviation = abs(rsi - 50).mean()
-        score = volatility * avg_rsi_deviation
-
-        asset_scores.append((asset, score))
-
-    asset_scores.sort(key=lambda x: x[1], reverse=True)
-    top_5 = [item[0] for item in asset_scores[:5]]
+        df_sub = df.tail(30)
+        score = df_sub["close"].std()
+        otc_scores.append((asset, score))
     
-    if len(top_5) < 5:
-        top_5 = ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "EURUSD", "GBPUSD"]
+    otc_scores.sort(key=lambda x: x[1], reverse=True)
+    top_otc = [item[0] for item in otc_scores[:5]]
+    if len(top_otc) < 5:
+        top_otc = ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "AUDUSD-OTC", "EURJPY-OTC"]
 
-    return top_5
+    std_scores = []
+    for asset, code in STANDARD_SYMBOLS.items():
+        df = get_candles(code, retries=2)
+        if df is None or len(df) < 20:
+            continue
+        df_sub = df.tail(30)
+        score = df_sub["close"].std()
+        std_scores.append((asset, score))
 
-def check_discord_commands():
-    """จำลองการเช็กคำสั่งล่าสุดผ่าน Discord Webhook API (หรือปรับใช้ Discord Bot หากต้องการอ่านข้อความเรียลไทม์)"""
-    # หมายเหตุ: เนื่องจาก Webhook เป็นทางเดียวในการส่งข้อความออก เพื่อความเสถียรบนคลาวด์ 
-    # คุณสามารถสั่งเปิด/ปิดผ่านตัวแปร Railway Variables หรือสร้างฟังก์ชันรับคำสั่งผ่าน Webhook ได้ทันที
-    pass
+    std_scores.sort(key=lambda x: x[1], reverse=True)
+    top_std = [item[0] for item in std_scores[:1]]
+    if len(top_std) < 1:
+        top_std = ["EURUSD"]
+
+    return top_otc + top_std
 
 while True:
     try:
         current_time = time.time()
         now_thai = datetime.now(tz_thai)
         hour = now_thai.hour
-
-        # หากปิดการทำงาน (BOT_SETTINGS["active"] == False) บอทจะข้ามการสแกนทั้งหมด
-        if not BOT_SETTINGS["active"]:
-            time.sleep(5)
-            continue
-
         session_id = f"{now_thai.strftime('%Y-%m-%d')}-{'AM' if hour < 12 else 'PM'}"
 
         if last_session_check != session_id:
             last_session_check = session_id
-            current_target_assets = select_top_5_assets()
-            assets_str = ", ".join([f"`{a}`" for a in current_target_assets])
+            current_target_assets = select_top_assets()
+            
+            otc_list = ", ".join([f"`{a}`" for a in current_target_assets[:5]])
+            std_item = f"`{current_target_assets[5]}`" if len(current_target_assets) > 5 else "`EURUSD`"
+            
             session_name = "รอบเช้า/ดึก (00:00 - 12:00)" if hour < 12 else "รอบบ่าย/ค่ำ (12:00 - 00:00)"
             msg = (
-                f"🔄 **อัปเดต 5 คู่เงินเด่นประจำรอบใหม่**\n"
+                f"🔄 **อัปเดตคู่เงินโฟกัส (OTC 5 + Standard 1)**\n"
                 f"📅 ช่วงเวลา: **{session_name}**\n"
-                f"🎯 5 คู่ที่บอทโฟกัส: {assets_str}"
+                f"🌐 **คู่ธรรมดา**: {std_item}\n"
+                f"📊 **คู่ OTC**: {otc_list}"
             )
             send_signal_message(msg)
             send_result_message(msg)
@@ -181,7 +167,7 @@ while True:
         current_min = now_utc.floor("min")
         current_sec = now_utc.second
 
-        # 1. วินาทีที่ 50: สแกนล่วงหน้า (Pre-Signal)
+        # 1. วินาทีที่ 50: สแกนหาจังหวะล่วงหน้าแบบยืดหยุ่น
         if current_sec >= 50 and last_pre_scan != current_min:
             last_pre_scan = current_min
             pending_signal = None
@@ -191,11 +177,12 @@ while True:
                 if current_time < stats[asset]["cooldown_until"]:
                     continue
 
-                df = get_candles(asset, retries=1)
-                if df is None or len(df) < 25:
+                symbol_code = ALL_SYMBOLS[asset]
+                df = get_candles(symbol_code, retries=1)
+                if df is None or len(df) < 20:
                     continue
 
-                signal, entry_price, rsi_val, score = analyze_market_with_score(df)
+                signal, entry_price, rsi_val, score = analyze_market_flexible(df)
 
                 if signal and score > highest_score:
                     highest_score = score
@@ -208,15 +195,14 @@ while True:
 
             if pending_signal:
                 pre_time_str = (now_thai + timedelta(minutes=1)).strftime("%H:%M")
-                prefix_tag = "🚨 [LIVE]" if BOT_SETTINGS["mode"] == "LIVE" else "🧪 [PAPER TEST]"
                 send_signal_message(
-                    f"{prefix_tag} **เตรียมตัวให้พร้อม! (Pre-Signal)**\n"
+                    f"⏳ **เตรียมตัว! (Pre-Signal จังหวะยืดหยุ่น)**\n"
                     f"🎯 เล็งคู่: `{pending_signal['asset']}`\n"
-                    f"📊 ทิศทางที่คาดการณ์: {pending_signal['signal']}\n"
-                    f"⏰ เตรียมเปิดหน้าจอรอคลิกตอนเวลา **{pre_time_str}** น."
+                    f"📊 ทิศทาง: {pending_signal['signal']}\n"
+                    f"⏰ เตรียมกดตอนเวลา **{pre_time_str}** น."
                 )
 
-        # 2. วินาทีที่ 1: ส่งสัญญาณจริงและประเมินผล
+        # 2. วินาทีที่ 1: ส่งสัญญาณจริงและประเมินผลพร้อมคำแนะนำการทบไม้
         if current_sec >= 1 and last_action_min != current_min:
             last_action_min = current_min
 
@@ -227,21 +213,27 @@ while True:
                 rsi_val = pending_signal["rsi"]
                 time_str = now_thai.strftime("%H:%M:%S")
 
-                prefix_tag = "🚨 [LIVE]" if BOT_SETTINGS["mode"] == "LIVE" else "🧪 [PAPER TEST]"
                 signal_msg = (
-                    f"{prefix_tag} **ลุยเลย! เปิดออเดอร์ทันที** (`{asset}`)\n"
+                    f"🚨 **เปิดออเดอร์!** (`{asset}`)\n"
                     f"⏰ เวลา: {time_str}\n"
-                    f"🎯 คำแนะนำ: {signal}\n"
+                    f"🎯 ทิศทาง: {signal}\n"
                     f"💵 ราคาเปิด: `{entry_price:.5f}`\n"
-                    f"📈 ค่า RSI: `{rsi_val:.1f}`"
+                    f"📈 RSI: `{rsi_val:.1f}`"
                 )
+                send_signal_market = signal_msg
+
+                # แนะนำการทบไม้ล่วงหน้าตามผลไม้ก่อนหน้า
+                if last_market_result == "LOSS":
+                    signal_msg += f"\n💡 *AI Tip: ไม้ที่แล้วแพ้ ไม้นี้พิจารณา **ทบไม้ (Martingale x2)** ด้วยความระมัดระวัง*"
+                
                 send_signal_message(signal_msg)
 
                 target_close = current_min + pd.Timedelta(minutes=1, seconds=3)
                 while pd.Timestamp.now(tz="UTC") < target_close:
                     time.sleep(0.3)
 
-                res_df = get_candles(asset, retries=3)
+                symbol_code = ALL_SYMBOLS[asset]
+                res_df = get_candles(symbol_code, retries=3)
                 if res_df is not None and current_min in res_df.index:
                     eval_c = res_df.loc[current_min]
                     open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
@@ -251,21 +243,26 @@ while True:
                         stats[asset]["win"] += 1
                         global_stats["win"] += 1
                         stats[asset]["consecutive_loss"] = 0
+                        last_market_result = "WIN"
+                        martingale_advice = "🎉 ไม้ที่แล้วชนะ! **ไม่ต้องทบไม้** กลับมาเดินเงินปกติครับ"
                     elif close_p == open_p:
                         res_txt = "⚖️ **TIE (เสมอ)**"
                         stats[asset]["tie"] += 1
                         global_stats["tie"] += 1
+                        last_market_result = "TIE"
+                        martingale_advice = "⚖️ เสมอ! แนะนำให้ **รอดูท่าทีก่อนหรือใช้ทุนเท่าเดิม**"
                     else:
                         res_txt = "❌ **LOSS (แพ้)**"
                         stats[asset]["loss"] += 1
                         global_stats["loss"] += 1
                         stats[asset]["consecutive_loss"] += 1
-
+                        last_market_result = "LOSS"
+                        
                         if stats[asset]["consecutive_loss"] >= 2:
                             stats[asset]["cooldown_until"] = time.time() + 1800
-                            cooldown_msg = f"🧠 **AI Notice:** คู่เงิน `{asset}` แพ้ติดกัน 2 ไม้! สั่งพักการเทรดคู่นี้ 30 นาทีเรียบร้อย"
-                            send_signal_message(cooldown_msg)
-                            send_result_message(cooldown_msg)
+                            martingale_advice = f"🚨 **แพ้ติดกัน 2 ไม้แล้ว!** แนะนำให้ **ปล่อยผ่าน (หยุดพักคู่นี้ 30 นาที)** ห้ามทบต่อเพื่อเซฟพอร์ต"
+                        else:
+                            martingale_advice = "💡 **ไม้แรกแพ้:** พิจารณา **ทบไม้ (Martingale x2)** ในไม้ถัดไปตามแผนบริหารทุน"
 
                     s = stats[asset]
                     total_asset = s["win"] + s["loss"]
@@ -274,17 +271,13 @@ while True:
                     tot_global = global_stats["win"] + global_stats["loss"]
                     wr_global = (global_stats["win"] / tot_global * 100) if tot_global > 0 else 0.0
 
-                    mode_label = "โหมดเทรดจริง (LIVE)" if BOT_SETTINGS["mode"] == "LIVE" else "โหมดทดลอง (PAPER)"
                     result_msg = (
-                        f"📊 **รายงานผลการเทรด ({mode_label})** (`{asset}`)\n"
+                        f"📊 **สรุปผล & คำแนะนำการทบไม้** (`{asset}`)\n"
                         f"----------------------------------------\n"
-                        f"📌 ผลลัพธ์ไม้ล่าสุด: {res_txt}\n"
-                        f"📈 **สถิติเฉพาะคู่ `{asset}`**:\n"
-                        f"   • ชนะ: `{s['win']}` | แพ้: `{s['loss']}` | เสมอ: `{s['tie']}`\n"
-                        f"   • Win Rate คู่นี้: `{wr_asset:.2f}%`\n"
-                        f"🌐 **สถิติภาพรวมทั้งหมด (Global Stats)**:\n"
-                        f"   • ชนะรวม: `{global_stats['win']}` | แพ้รวม: `{global_stats['loss']}`\n"
-                        f"   • Win Rate รวมทุกคู่: `{wr_global:.2f}%`\n"
+                        f"📌 ผลลัพธ์: {res_txt}\n"
+                        f"💬 **คำแนะนำจาก AI**: {martingale_advice}\n"
+                        f"📈 **สถิติคู่ `{asset}`**: ชนะ `{s['win']}` | แพ้ `{s['loss']}` (Win Rate: `{wr_asset:.2f}%`)\n"
+                        f"🌐 **สถิติภาพรวม**: Win Rate รวม `{wr_global:.2f}%`\n"
                         f"----------------------------------------"
                     )
                     send_result_message(result_msg)
