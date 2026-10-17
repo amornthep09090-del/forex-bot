@@ -1,6 +1,7 @@
 import os
 import time
 from datetime import datetime, timezone, timedelta
+import threading
 import requests
 import pandas as pd
 import numpy as np
@@ -57,7 +58,7 @@ def send_result_message(text):
     except Exception as e:
         print(f"⚠️ Result Webhook Error: {e}")
 
-def get_candles(symbol_code, retries=4):
+def get_candles(symbol_code, retries=3):
     for _ in range(retries):
         try:
             df = yf.Ticker(symbol_code).history(period="2d", interval="1m")
@@ -66,11 +67,11 @@ def get_candles(symbol_code, retries=4):
                 idx = df.index
                 df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
                 df = df[["open", "high", "low", "close"]].astype(float)
-                if len(df) >= 10:
+                if len(df) >= 15:
                     return df
         except Exception:
             pass
-        time.sleep(1.5)
+        time.sleep(1)
     return None
 
 def analyze_market_flexible(df):
@@ -81,7 +82,7 @@ def analyze_market_flexible(df):
     gain = (delta.where(delta > 0, 0)).rolling(window=7).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=7).mean()
     rs = gain / loss.replace(0, np.nan)
-    df["rsi"] = (100 - (100 / (1 + rs))).fillna(50)
+    df["rsi"] = (100 - (100 / (1 + rs)))
 
     df["sma20"] = df["close"].rolling(window=15).mean()
     df["std20"] = df["close"].rolling(window=15).std()
@@ -90,6 +91,9 @@ def analyze_market_flexible(df):
 
     last = df.iloc[-1]
     rsi_val = float(last["rsi"])
+    if pd.isna(rsi_val):
+        rsi_val = 50.0
+
     signal = None
     score = 0
 
@@ -102,9 +106,67 @@ def analyze_market_flexible(df):
 
     return signal, float(last["close"]), rsi_val, score
 
-print("✅ บอทแก้ไขระบบซิงค์เวลาและรายงานผล เริ่มทำงานแล้ว")
-send_main_message("🌐 **Main Market Bot รีสตาร์ทแก้บั๊กสำเร็จ!**")
-send_otc_message("📊 **OTC Market Bot รีสตาร์ทแก้บั๊กสำเร็จ!**")
+def evaluate_trade_background(market_type, asset, symbol_code, signal, signal_min):
+    """ฟังก์ชันทำงานเบื้องหลังเพื่อรอเช็กผล WIN/LOSS แบบไม่บล็อกบอทหลัก"""
+    try:
+        # รอให้แท่งเทียนวิ่งจบและข้อมูลอัปเดตบนเซิร์ฟเวอร์ (ประมาณ 65 วินาที)
+        target_close = signal_min + pd.Timedelta(minutes=1, seconds=65)
+        while pd.Timestamp.now(tz="UTC") < target_close:
+            time.sleep(1)
+
+        res_df = get_candles(symbol_code, retries=5)
+        if res_df is not None and signal_min in res_df.index:
+            eval_c = res_df.loc[signal_min]
+            open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
+
+            if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
+                res_txt = "✅ **WIN (ชนะ)**"
+                stats[asset]["win"] += 1
+                global_stats["win"] += 1
+                stats[asset]["consecutive_loss"] = 0
+                last_result_type[market_type] = "WIN"
+                advice = "🎉 ชนะ! เดินเงินปกติ ไม่ต้องทบ"
+            elif close_p == open_p:
+                res_txt = "⚖️ **TIE (เสมอ)**"
+                stats[asset]["tie"] += 1
+                global_stats["tie"] += 1
+                last_result_type[market_type] = "TIE"
+                advice = "⚖️ เสมอ ใช้ทุนเท่าเดิม"
+            else:
+                res_txt = "❌ **LOSS (แพ้)**"
+                stats[asset]["loss"] += 1
+                global_stats["loss"] += 1
+                stats[asset]["consecutive_loss"] += 1
+                last_result_type[market_type] = "LOSS"
+                if stats[asset]["consecutive_loss"] >= 2:
+                    stats[asset]["cooldown_until"] = time.time() + 1800
+                    advice = "🚨 แพ้ติดกัน 2 ไม้! พักคู่นี้ 30 นาที"
+                else:
+                    advice = "💡 แพ้ไม้แรก พิจารณาทบไม้ (Martingale x2)"
+
+            s = stats[asset]
+            tot = s["win"] + s["loss"]
+            wr = (s["win"] / tot * 100) if tot > 0 else 0.0
+            tot_global = global_stats["win"] + global_stats["loss"]
+            wr_global = (global_stats["win"] / tot_global * 100) if tot_global > 0 else 0.0
+
+            title_tag = "Main Result Report" if market_type == "MAIN" else "OTC Result Report"
+            send_result_message(
+                f"📊 **[{title_tag}]**\n"
+                f"----------------------------------------\n"
+                f"🎯 คู่เงิน: `{asset}`\n"
+                f"📌 ผลลัพธ์: {res_txt}\n"
+                f"💬 คำแนะนำ: {advice}\n"
+                f"📈 สถิติคู่ `{asset}`: ชนะ `{s['win']}` | แพ้ `{s['loss']}` (Win Rate: `{wr:.2f}%`)\n"
+                f"🌐 สถิติภาพรวมทั้งหมด: ชนะ `{global_stats['win']}` | แพ้ `{global_stats['loss']}` (Win Rate รวม: `{wr_global:.2f}%`)\n"
+                f"----------------------------------------"
+            )
+    except Exception as e:
+        print(f"⚠️ Evaluation Error: {e}")
+
+print("✅ บอทระบบ Multi-threading เริ่มทำงานแล้ว")
+send_main_message("🌐 **Main Market Bot พร้อมทำงาน!**")
+send_otc_message("📊 **OTC Market Bot พร้อมทำงาน!**")
 send_result_message("🏆 **Global Statistics Bot พร้อมรายงานผล WIN/LOSS แล้ว!**")
 
 last_pre_scan = None
@@ -168,17 +230,17 @@ while True:
                     f"----------------------------------------"
                 )
 
-        # 2. วินาทีที่ 1: ส่งสัญญาณจริงและประเมินผล
+        # 2. วินาทีที่ 1: ส่งสัญญาณจริงและเปิดเธรดรอประเมินผลเบื้องหลัง
         if current_sec >= 1 and last_action_min != current_min:
             last_action_min = current_min
             action_time_str = now_thai.strftime("%H:%M:%S")
+            signal_min = current_min
 
             # ประมวลผล Main
             if pending_signals["MAIN"]:
                 p_std = pending_signals["MAIN"]
                 asset = p_std["asset"]
                 signal = p_std["signal"]
-                signal_min = current_min
                 
                 msg = (
                     f"🚨 **[Main] ลุยเลย! เปิดออเดอร์**\n"
@@ -194,64 +256,15 @@ while True:
                 msg += f"\n----------------------------------------"
                 send_main_message(msg)
 
-                # รอให้แท่งเทียนวิ่งจบและข้อมูลอัปเดต (ประมาณ 65 วินาที)
-                target_close = signal_min + pd.Timedelta(minutes=1, seconds=62)
-                while pd.Timestamp.now(tz="UTC") < target_close:
-                    time.sleep(0.5)
-
-                res_df = get_candles(STANDARD_SYMBOLS[asset], retries=4)
-                if res_df is not None and signal_min in res_df.index:
-                    eval_c = res_df.loc[signal_min]
-                    open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
-
-                    if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
-                        res_txt = "✅ **WIN (ชนะ)**"
-                        stats[asset]["win"] += 1
-                        global_stats["win"] += 1
-                        stats[asset]["consecutive_loss"] = 0
-                        last_result_type["MAIN"] = "WIN"
-                        advice = "🎉 ชนะ! เดินเงินปกติ ไม่ต้องทบ"
-                    elif close_p == open_p:
-                        res_txt = "⚖️ **TIE (เสมอ)**"
-                        stats[asset]["tie"] += 1
-                        global_stats["tie"] += 1
-                        last_result_type["MAIN"] = "TIE"
-                        advice = "⚖️ เสมอ ใช้ทุนเท่าเดิม"
-                    else:
-                        res_txt = "❌ **LOSS (แพ้)**"
-                        stats[asset]["loss"] += 1
-                        global_stats["loss"] += 1
-                        stats[asset]["consecutive_loss"] += 1
-                        last_result_type["MAIN"] = "LOSS"
-                        if stats[asset]["consecutive_loss"] >= 2:
-                            stats[asset]["cooldown_until"] = time.time() + 1800
-                            advice = "🚨 แพ้ติดกัน 2 ไม้! พักคู่นี้ 30 นาที"
-                        else:
-                            advice = "💡 แพ้ไม้แรก พิจารณาทบไม้ (Martingale x2)"
-
-                    s = stats[asset]
-                    tot = s["win"] + s["loss"]
-                    wr = (s["win"] / tot * 100) if tot > 0 else 0.0
-                    tot_global = global_stats["win"] + global_stats["loss"]
-                    wr_global = (global_stats["win"] / tot_global * 100) if tot_global > 0 else 0.0
-
-                    send_result_message(
-                        f"📊 **[Main Result Report]**\n"
-                        f"----------------------------------------\n"
-                        f"🎯 คู่เงิน: `{asset}`\n"
-                        f"📌 ผลลัพธ์: {res_txt}\n"
-                        f"💬 คำแนะนำ: {advice}\n"
-                        f"📈 สถิติคู่ `{asset}`: ชนะ `{s['win']}` | แพ้ `{s['loss']}` (Win Rate: `{wr:.2f}%`)\n"
-                        f"🌐 สถิติภาพรวมทั้งหมด: ชนะ `{global_stats['win']}` | แพ้ `{global_stats['loss']}` (Win Rate รวม: `{wr_global:.2f}%`)\n"
-                        f"----------------------------------------"
-                    )
+                # เปิด Background Thread รอเช็กผลแบบไม่บล็อกบอท
+                t = threading.Thread(target=evaluate_trade_background, args=("MAIN", asset, STANDARD_SYMBOLS[asset], signal, signal_min))
+                t.start()
 
             # ประมวลผล OTC
             if pending_signals["OTC"]:
                 p_otc = pending_signals["OTC"]
                 asset = p_otc["asset"]
                 signal = p_otc["signal"]
-                signal_min = current_min
                 
                 msg = (
                     f"🚨 **[OTC] ลุยเลย! เปิดออเดอร์**\n"
@@ -267,56 +280,9 @@ while True:
                 msg += f"\n----------------------------------------"
                 send_otc_message(msg)
 
-                target_close = signal_min + pd.Timedelta(minutes=1, seconds=62)
-                while pd.Timestamp.now(tz="UTC") < target_close:
-                    time.sleep(0.5)
-
-                res_df = get_candles(OTC_SYMBOLS[asset], retries=4)
-                if res_df is not None and signal_min in res_df.index:
-                    eval_c = res_df.loc[signal_min]
-                    open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
-
-                    if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
-                        res_txt = "✅ **WIN (ชนะ)**"
-                        stats[asset]["win"] += 1
-                        global_stats["win"] += 1
-                        stats[asset]["consecutive_loss"] = 0
-                        last_result_type["OTC"] = "WIN"
-                        advice = "🎉 ชนะ! เดินเงินปกติ ไม่ต้องทบ"
-                    elif close_p == open_p:
-                        res_txt = "⚖️ **TIE (เสมอ)**"
-                        stats[asset]["tie"] += 1
-                        global_stats["tie"] += 1
-                        last_result_type["OTC"] = "TIE"
-                        advice = "⚖️ เสมอ ใช้ทุนเท่าเดิม"
-                    else:
-                        res_txt = "❌ **LOSS (แพ้)**"
-                        stats[asset]["loss"] += 1
-                        global_stats["loss"] += 1
-                        stats[asset]["consecutive_loss"] += 1
-                        last_result_type["OTC"] = "LOSS"
-                        if stats[asset]["consecutive_loss"] >= 2:
-                            stats[asset]["cooldown_until"] = time.time() + 1800
-                            advice = "🚨 แพ้ติดกัน 2 ไม้! พักคู่นี้ 30 นาที"
-                        else:
-                            advice = "💡 แพ้ไม้แรก พิจารณาทบไม้ (Martingale x2)"
-
-                    s = stats[asset]
-                    tot = s["win"] + s["loss"]
-                    wr = (s["win"] / tot * 100) if tot > 0 else 0.0
-                    tot_global = global_stats["win"] + global_stats["loss"]
-                    wr_global = (global_stats["win"] / tot_global * 100) if tot_global > 0 else 0.0
-
-                    send_result_message(
-                        f"📊 **[OTC Result Report]**\n"
-                        f"----------------------------------------\n"
-                        f"🎯 คู่เงิน: `{asset}`\n"
-                        f"📌 ผลลัพธ์: {res_txt}\n"
-                        f"💬 คำแนะนำ: {advice}\n"
-                        f"📈 สถิติคู่ `{asset}`: ชนะ `{s['win']}` | แพ้ `{s['loss']}` (Win Rate: `{wr:.2f}%`)\n"
-                        f"🌐 สถิติภาพรวมทั้งหมด: ชนะ `{global_stats['win']}` | แพ้ `{global_stats['loss']}` (Win Rate รวม: `{wr_global:.2f}%`)\n"
-                        f"----------------------------------------"
-                    )
+                # เปิด Background Thread รอเช็กผลแบบไม่บล็อกบอท
+                t = threading.Thread(target=evaluate_trade_background, args=("OTC", asset, OTC_SYMBOLS[asset], signal, signal_min))
+                t.start()
 
             pending_signals = {"MAIN": None, "OTC": None}
 
