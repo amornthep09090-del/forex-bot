@@ -65,17 +65,20 @@ def is_market_open():
     return True
 
 def get_candles(asset, retries=3):
-    for _ in range(retries):
+    """ฟังก์ชันดึงกราฟพร้อมระบบพยายามใหม่ (Retry) อัตโนมัติ ป้องกันข้อมูลหลุด"""
+    for attempt in range(retries):
         try:
-            df = yf.Ticker(SYMBOLS[asset]).history(period="2d", interval="1m")
+            # ขยาย period เป็น 5d เพื่อความเสถียรในการดึงข้อมูลย้อนหลัง
+            df = yf.Ticker(SYMBOLS[asset]).history(period="5d", interval="1m")
             if df is not None and not df.empty:
                 df = df.rename(columns=str.lower)
                 idx = df.index
                 df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
                 return df[["open", "high", "low", "close"]].astype(float)
-        except Exception:
+        except Exception as e:
+            # เงียบไว้หรือพิมพ์เตือนเบาๆ ไม่ให้ Log แดงพรืด
             pass
-        time.sleep(1)
+        time.sleep(1.5)
     return None
 
 def analyze_market_with_score(df):
@@ -109,8 +112,8 @@ def analyze_market_with_score(df):
 
     return signal, last["close"], rsi_val, score
 
-print("✅ บอท AI โหมดเตือนล่วงหน้า (Pre-Signal) เริ่มทำงานแล้ว")
-send_signal_message("🤖 AI Pre-Signal Mode พร้อม! บอทจะส่งข้อความเตือนล่วงหน้าก่อนเปลี่ยนแท่งเทียนให้คุณเตรียมเปิดจอรอ")
+print("✅ บอท AI โหมดทนทานพิเศษ (Robust Pre-Signal) เริ่มทำงานแล้ว")
+send_signal_message("🤖 AI Robust Mode พร้อม! อัปเกรดระบบดึงข้อมูลให้เสถียรขึ้นเรียบร้อย")
 
 last_pre_scan = None
 last_action_min = None
@@ -137,7 +140,7 @@ while True:
         current_min = now_utc.floor("min")
         current_sec = now_utc.second
 
-        # 1. ช่วงวินาทีที่ 50 ของนาทีปัจจุบัน: ทำการสแกนล่วงหน้า (Pre-Scan) เพื่อเตือนให้เตรียมตัว
+        # 1. วินาทีที่ 50: สแกนล่วงหน้า (Pre-Scan)
         if current_sec >= 50 and last_pre_scan != current_min:
             last_pre_scan = current_min
             pending_candidate = None
@@ -147,7 +150,7 @@ while True:
                 if current_time < stats[asset]["cooldown_until"]:
                     continue
 
-                df = get_candles(asset, retries=1)
+                df = get_candles(asset, retries=2)
                 if df is None or len(df) < 25:
                     continue
 
@@ -162,7 +165,6 @@ while True:
                         "rsi": rsi_val
                     }
 
-            # ถ้าเจอคู่ที่น่าสนใจ ส่งข้อความเตือนล่วงหน้าให้เตรียมเปิดจอรอทันที!
             if pending_candidate:
                 pre_time_str = (datetime.now(tz_thai) + timedelta(minutes=1)).strftime("%H:%M")
                 pre_msg = (
@@ -173,7 +175,7 @@ while True:
                 )
                 send_signal_message(pre_msg)
 
-        # 2. เมื่อขึ้นวินาทีที่ 1 ของนาทีใหม่: ส่งสัญญาณจริงและจับตาผลลัพธ์
+        # 2. วินาทีที่ 1 ของนาทีใหม่: ส่งสัญญาณจริง
         if current_sec >= 1 and last_action_min != current_min:
             last_action_min = current_min
 
@@ -198,7 +200,7 @@ while True:
                 while pd.Timestamp.now(tz="UTC") < target_close:
                     time.sleep(0.3)
 
-                res_df = get_candles(asset, retries=2)
+                res_df = get_candles(asset, retries=3)
                 if res_df is not None and current_min in res_df.index:
                     eval_c = res_df.loc[current_min]
                     open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
@@ -235,7 +237,7 @@ while True:
                     )
                     send_result_message(result_msg)
 
-                pending_candidate = None  # ล้างค่าเตรียมรอบถัดไป
+                pending_candidate = None
 
         time.sleep(0.5)
     except Exception as e:
