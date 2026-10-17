@@ -6,13 +6,12 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
-# ดึงค่า Token และ User ID จากระบบ Railway
-LINE_SIGNAL_TOKEN = os.getenv("LINE_SIGNAL_TOKEN", "").strip()
-LINE_RESULT_TOKEN = os.getenv("LINE_RESULT_TOKEN", "").strip()
-LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
+# ดึงค่า Discord Webhook URL ทั้ง 2 ช่องจาก Railway Variables
+DISCORD_SIGNAL_WEBHOOK = os.getenv("DISCORD_SIGNAL_WEBHOOK", "").strip()
+DISCORD_RESULT_WEBHOOK = os.getenv("DISCORD_RESULT_WEBHOOK", "").strip()
 
-if not LINE_SIGNAL_TOKEN or not LINE_RESULT_TOKEN or not LINE_USER_ID:
-    print("❌ กรุณาตั้งค่า LINE_SIGNAL_TOKEN, LINE_RESULT_TOKEN และ LINE_USER_ID ให้ครบถ้วน")
+if not DISCORD_SIGNAL_WEBHOOK or not DISCORD_RESULT_WEBHOOK:
+    print("❌ กรุณาตั้งค่า DISCORD_SIGNAL_WEBHOOK และ DISCORD_RESULT_WEBHOOK ใน Railway Variables ให้ครบถ้วน")
     exit(1)
 
 tz_thai = timezone(timedelta(hours=7))
@@ -36,22 +35,18 @@ stats = {asset: {"win": 0, "loss": 0, "tie": 0, "consecutive_loss": 0, "cooldown
 global_stats = {"win": 0, "loss": 0, "tie": 0}
 
 def send_signal_message(text):
-    url = "https://api.line.me/v2/bot/message/push"
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LINE_SIGNAL_TOKEN}"}
-    payload = {"to": LINE_USER_ID, "messages": [{"type": "text", "text": text}]}
+    """ส่งข้อความเข้าห้องสัญญาณเทรด"""
     try:
-        requests.post(url, headers=headers, json=payload, timeout=10)
+        requests.post(DISCORD_SIGNAL_WEBHOOK, json={"content": text}, timeout=10)
     except Exception as e:
-        print(f"⚠️ Signal Exception: {e}")
+        print(f"⚠️ Signal Webhook Error: {e}")
 
 def send_result_message(text):
-    url = "https://api.line.me/v2/bot/message/push"
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {LINE_RESULT_TOKEN}"}
-    payload = {"to": LINE_USER_ID, "messages": [{"type": "text", "text": text}]}
+    """ส่งข้อความเข้าห้องสรุปผลและสถิติ"""
     try:
-        requests.post(url, headers=headers, json=payload, timeout=10)
+        requests.post(DISCORD_RESULT_WEBHOOK, json={"content": text}, timeout=10)
     except Exception as e:
-        print(f"⚠️ Result Exception: {e}")
+        print(f"⚠️ Result Webhook Error: {e}")
 
 def get_candles(asset, retries=3):
     for _ in range(retries):
@@ -96,7 +91,9 @@ def analyze_market_with_score(df):
 
     return signal, last["close"], rsi_val, score
 
-print("✅ บอทโหมดประหยัดโควตา LINE เริ่มทำงานแล้ว")
+print("✅ บอทโหมดแยกห้อง Discord (Signal & Statistics) เริ่มทำงานแล้ว")
+send_signal_message("🤖 **AI Signal Bot เชื่อมต่อสำเร็จ!** พร้อมส่งสัญญาณเทรดและวิเคราะห์กราฟแบบจัดเต็ม")
+send_result_message("📊 **AI Statistics Bot เชื่อมต่อสำเร็จ!** ห้องนี้จะรายงานผลการเทรดและสถิติภาพรวมทั้งหมด")
 
 current_target_assets = []
 last_session_check = None
@@ -140,16 +137,26 @@ while True:
 
         session_id = f"{now_thai.strftime('%Y-%m-%d')}-{'AM' if hour < 12 else 'PM'}"
 
-        # อัปเดตรายชื่อ 5 คู่เด่นเงียบๆ ทุกเที่ยงวัน/เที่ยงคืน (ไม่ส่งข้อความหา LINE เพื่อประหยัดโควตา)
         if last_session_check != session_id:
             last_session_check = session_id
             current_target_assets = select_top_5_assets()
+            assets_str = ", ".join([f"`{a}`" for a in current_target_assets])
+            
+            # แจ้งเตือนการเปลี่ยนคู่เงินเด่นทั้ง 2 ห้อง
+            session_name = "รอบเช้า/ดึก (00:00 - 12:00)" if hour < 12 else "รอบบ่าย/ค่ำ (12:00 - 00:00)"
+            msg = (
+                f"🔄 **อัปเดต 5 คู่เงินเด่นประจำรอบใหม่**\n"
+                f"📅 ช่วงเวลา: **{session_name}**\n"
+                f"🎯 5 คู่ที่บอทโฟกัส: {assets_str}"
+            )
+            send_signal_message(msg)
+            send_result_message(msg)
 
         now_utc = pd.Timestamp.now(tz="UTC")
         current_min = now_utc.floor("min")
         current_sec = now_utc.second
 
-        # 1. วินาทีที่ 50: สแกนล่วงหน้า (Pre-Signal) ส่งเฉพาะตอนเจอสัญญาณเท่านั้น
+        # 1. วินาทีที่ 50: สแกนล่วงหน้า (Pre-Signal)
         if current_sec >= 50 and last_pre_scan != current_min:
             last_pre_scan = current_min
             pending_signal = None
@@ -177,10 +184,10 @@ while True:
             if pending_signal:
                 pre_time_str = (now_thai + timedelta(minutes=1)).strftime("%H:%M")
                 send_signal_message(
-                    f"⏳ เตรียมตัวให้พร้อม! (Pre-Signal)\n"
-                    f"🎯 เล็งคู่: {pending_signal['asset']}\n"
-                    f"📊 ทิศทาง: {pending_signal['signal']}\n"
-                    f"⏰ เตรียมกดตอนเวลา {pre_time_str} น."
+                    f"⏳ **เตรียมตัวให้พร้อม! (Pre-Signal)**\n"
+                    f"🎯 เล็งคู่: `{pending_signal['asset']}`\n"
+                    f"📊 ทิศทางที่คาดการณ์: {pending_signal['signal']}\n"
+                    f"⏰ เตรียมเปิดหน้าจอรอคลิกตอนเวลา **{pre_time_str}** น."
                 )
 
         # 2. วินาทีที่ 1: ส่งสัญญาณจริงและประเมินผล
@@ -195,11 +202,11 @@ while True:
                 time_str = now_thai.strftime("%H:%M:%S")
 
                 signal_msg = (
-                    f"🚨 **ลุยเลย! เปิดออเดอร์** ({asset})\n"
+                    f"🚨 **ลุยเลย! เปิดออเดอร์ทันที** (`{asset}`)\n"
                     f"⏰ เวลา: {time_str}\n"
-                    f"🎯 แนะนำ: {signal}\n"
-                    f"💵 ราคาเปิด: {entry_price:.5f}\n"
-                    f"📈 RSI: {rsi_val:.1f}"
+                    f"🎯 คำแนะนำ: {signal}\n"
+                    f"💵 ราคาเปิด: `{entry_price:.5f}`\n"
+                    f"📈 ค่า RSI: `{rsi_val:.1f}`"
                 )
                 send_signal_message(signal_msg)
 
@@ -213,34 +220,45 @@ while True:
                     open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
 
                     if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
-                        res_txt = "✅ WIN (ชนะ)"
+                        res_txt = "✅ **WIN (ชนะ)**"
                         stats[asset]["win"] += 1
                         global_stats["win"] += 1
                         stats[asset]["consecutive_loss"] = 0
                     elif close_p == open_p:
-                        res_txt = "⚖️ TIE (เสมอ)"
+                        res_txt = "⚖️ **TIE (เสมอ)**"
                         stats[asset]["tie"] += 1
                         global_stats["tie"] += 1
                     else:
-                        res_txt = "❌ LOSS (แพ้)"
+                        res_txt = "❌ **LOSS (แพ้)**"
                         stats[asset]["loss"] += 1
                         global_stats["loss"] += 1
                         stats[asset]["consecutive_loss"] += 1
 
                         if stats[asset]["consecutive_loss"] >= 2:
                             stats[asset]["cooldown_until"] = time.time() + 1800
-                            # แจ้งเตือนเงียบๆ เฉพาะตอนติด Cooldown
-                            send_signal_message(f"🧠 AI Notice: คู่เงิน {asset} แพ้ติดกัน 2 ไม้! พัก 30 นาที")
+                            cooldown_msg = f"🧠 **AI Notice:** คู่เงิน `{asset}` แพ้ติดกัน 2 ไม้! สั่งพักการเทรดคู่นี้ 30 นาทีเรียบร้อย"
+                            send_signal_message(cooldown_msg)
+                            send_result_message(cooldown_msg)
 
+                    # คำนวณสถิติเพื่อส่งเข้าห้อง Result โดยเฉพาะ
                     s = stats[asset]
-                    total = s["win"] + s["loss"]
-                    wr = (s["win"] / total * 100) if total > 0 else 0.0
+                    total_asset = s["win"] + s["loss"]
+                    wr_asset = (s["win"] / total_asset * 100) if total_asset > 0 else 0.0
+
+                    tot_global = global_stats["win"] + global_stats["loss"]
+                    wr_global = (global_stats["win"] / tot_global * 100) if tot_global > 0 else 0.0
 
                     result_msg = (
-                        f"🏁 สรุปผลลัพธ์ ({asset})\n"
-                        f"ผล: {res_txt}\n"
-                        f"🏆 ชนะ {s['win']} | แพ้ {s['loss']}\n"
-                        f"🔥 Win Rate คู่นี้: {wr:.2f}%"
+                        f"📊 **รายงานผลการเทรดและสถิติ** (`{asset}`)\n"
+                        f"----------------------------------------\n"
+                        f"📌 ผลลัพธ์ไม้ล่าสุด: {res_txt}\n"
+                        f"📈 **สถิติเฉพาะคู่ `{asset}`**:\n"
+                        f"   • ชนะ: `{s['win']}` | แพ้: `{s['loss']}` | เสมอ: `{s['tie']}`\n"
+                        f"   • Win Rate คู่นี้: `{wr_asset:.2f}%`\n"
+                        f"🌐 **สถิติภาพรวมทั้งหมด (Global Stats)**:\n"
+                        f"   • ชนะรวม: `{global_stats['win']}` | แพ้รวม: `{global_stats['loss']}`\n"
+                        f"   • Win Rate รวมทุกคู่: `{wr_global:.2f}%`\n"
+                        f"----------------------------------------"
                     )
                     send_result_message(result_msg)
 
