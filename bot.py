@@ -96,14 +96,12 @@ def analyze_market_with_score(df):
 
     return signal, last["close"], rsi_val, score
 
-print("✅ บอทโหมดรองรับคู่ OTC พร้อมสลับ 5 คู่เด่น เริ่มทำงานแล้ว")
-send_signal_message("🤖 AI OTC & Standard Picker พร้อม! รองรับคู่ OTC และสลับ 5 คู่เด่นทุกเที่ยงวัน/เที่ยงคืน")
+print("✅ บอทโหมดประหยัดโควตา LINE เริ่มทำงานแล้ว")
 
 current_target_assets = []
 last_session_check = None
 last_pre_scan = None
 last_action_min = None
-last_heartbeat = time.time()
 pending_signal = None
 
 def select_top_5_assets():
@@ -142,32 +140,16 @@ while True:
 
         session_id = f"{now_thai.strftime('%Y-%m-%d')}-{'AM' if hour < 12 else 'PM'}"
 
-        # เปลี่ยนรอบทุกๆ เที่ยงคืน (00:00) และเที่ยงวัน (12:00) โดยรองรับคู่ OTC จึงไม่ต้องเช็กวันหยุดตลาดปิด
+        # อัปเดตรายชื่อ 5 คู่เด่นเงียบๆ ทุกเที่ยงวัน/เที่ยงคืน (ไม่ส่งข้อความหา LINE เพื่อประหยัดโควตา)
         if last_session_check != session_id:
             last_session_check = session_id
-            send_signal_message(f"🔄 กำลังวิเคราะห์ตลาดเพื่อคัดเลือก 5 คู่เงินเด่น (รวม OTC) ประจำรอบ...")
             current_target_assets = select_top_5_assets()
-            
-            assets_str = ", ".join(current_target_assets)
-            send_signal_message(
-                f"🏆 ประกาศ 5 คู่เงินเด่น (รวม OTC) ประจำรอบใหม่!\n"
-                f"📅 ช่วงเวลา: {session_id}\n"
-                f"🎯 5 คู่ที่แนะนำให้โฟกัส: **{assets_str}**\n"
-                f"💡 บอทจะสแกนเฉพาะ 5 คู่นี้วนไปจนกว่าจะถึงรอบถัดไป (12:00 / 00:00)"
-            )
-
-        # รายงานสถานะทุก 30 นาที
-        if current_time - last_heartbeat >= 1800:
-            last_heartbeat = current_time
-            tot = global_stats["win"] + global_stats["loss"]
-            wr_all = (global_stats["win"] / tot * 100) if tot > 0 else 0.0
-            send_signal_message(f"🟢 บอทยังเฝ้า 5 คู่เด่น (รวม OTC) ปกติ\n📊 สถิติรวม: ชนะ {global_stats['win']} | แพ้ {global_stats['loss']} (Win Rate: {wr_all:.2f}%)")
 
         now_utc = pd.Timestamp.now(tz="UTC")
         current_min = now_utc.floor("min")
         current_sec = now_utc.second
 
-        # 1. วินาทีที่ 50: สแกนล่วงหน้า (Pre-Signal)
+        # 1. วินาทีที่ 50: สแกนล่วงหน้า (Pre-Signal) ส่งเฉพาะตอนเจอสัญญาณเท่านั้น
         if current_sec >= 50 and last_pre_scan != current_min:
             last_pre_scan = current_min
             pending_signal = None
@@ -247,7 +229,8 @@ while True:
 
                         if stats[asset]["consecutive_loss"] >= 2:
                             stats[asset]["cooldown_until"] = time.time() + 1800
-                            send_signal_message(f"🧠 AI Notice: คู่เงิน {asset} แพ้ติดกัน 2 ไม้ติด! สั่งพักการเทรด 30 นาที")
+                            # แจ้งเตือนเงียบๆ เฉพาะตอนติด Cooldown
+                            send_signal_message(f"🧠 AI Notice: คู่เงิน {asset} แพ้ติดกัน 2 ไม้! พัก 30 นาที")
 
                     s = stats[asset]
                     total = s["win"] + s["loss"]
