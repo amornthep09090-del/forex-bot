@@ -107,7 +107,6 @@ def analyze_market_flexible(df):
     return signal, float(last["close"]), rsi_val, score
 
 def evaluate_trade_background(market_type, asset, symbol_code, signal, signal_min):
-    """ฟังก์ชันทำงานเบื้องหลังเพื่อรอเช็กผล WIN/LOSS แบบไม่บล็อกบอทหลัก"""
     try:
         # รอให้แท่งเทียนวิ่งจบและข้อมูลอัปเดตบนเซิร์ฟเวอร์ (ประมาณ 65 วินาที)
         target_close = signal_min + pd.Timedelta(minutes=1, seconds=65)
@@ -115,8 +114,13 @@ def evaluate_trade_background(market_type, asset, symbol_code, signal, signal_mi
             time.sleep(1)
 
         res_df = get_candles(symbol_code, retries=5)
-        if res_df is not None and signal_min in res_df.index:
-            eval_c = res_df.loc[signal_min]
+        if res_df is not None and not res_df.empty:
+            # ระบบค้นหาข้อมูลแท่งเทียนแบบยืดหยุ่น (รองรับกรณีเวลาคลาดเคลื่อน)
+            if signal_min in res_df.index:
+                eval_c = res_df.loc[signal_min]
+            else:
+                eval_c = res_df.iloc[-2] if len(res_df) >= 2 else res_df.iloc[-1]
+
             open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
 
             if ("BUY" in signal and close_p > open_p) or ("SELL" in signal and close_p < open_p):
@@ -164,7 +168,7 @@ def evaluate_trade_background(market_type, asset, symbol_code, signal, signal_mi
     except Exception as e:
         print(f"⚠️ Evaluation Error: {e}")
 
-print("✅ บอทระบบ Multi-threading เริ่มทำงานแล้ว")
+print("✅ บอทระบบรายงานผลพร้อมใช้งานแล้ว")
 send_main_message("🌐 **Main Market Bot พร้อมทำงาน!**")
 send_otc_message("📊 **OTC Market Bot พร้อมทำงาน!**")
 send_result_message("🏆 **Global Statistics Bot พร้อมรายงานผล WIN/LOSS แล้ว!**")
@@ -256,7 +260,6 @@ while True:
                 msg += f"\n----------------------------------------"
                 send_main_message(msg)
 
-                # เปิด Background Thread รอเช็กผลแบบไม่บล็อกบอท
                 t = threading.Thread(target=evaluate_trade_background, args=("MAIN", asset, STANDARD_SYMBOLS[asset], signal, signal_min))
                 t.start()
 
@@ -280,7 +283,6 @@ while True:
                 msg += f"\n----------------------------------------"
                 send_otc_message(msg)
 
-                # เปิด Background Thread รอเช็กผลแบบไม่บล็อกบอท
                 t = threading.Thread(target=evaluate_trade_background, args=("OTC", asset, OTC_SYMBOLS[asset], signal, signal_min))
                 t.start()
 
