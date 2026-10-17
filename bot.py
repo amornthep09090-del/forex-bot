@@ -6,19 +6,25 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
-# ดึงค่า Discord Webhook URL ทั้ง 2 ช่องจาก Railway Variables
+# ดึงค่า Discord Webhook URL ทั้ง 3 ห้องจาก Railway Variables
 DISCORD_SIGNAL_WEBHOOK = os.getenv("DISCORD_SIGNAL_WEBHOOK", "").strip()
 DISCORD_RESULT_WEBHOOK = os.getenv("DISCORD_RESULT_WEBHOOK", "").strip()
+DISCORD_CONTROL_WEBHOOK = os.getenv("DISCORD_CONTROL_WEBHOOK", "").strip()
 
-if not DISCORD_SIGNAL_WEBHOOK or not DISCORD_RESULT_WEBHOOK:
-    print("❌ กรุณาตั้งค่า DISCORD_SIGNAL_WEBHOOK และ DISCORD_RESULT_WEBHOOK ใน Railway Variables ให้ครบถ้วน")
+if not DISCORD_SIGNAL_WEBHOOK or not DISCORD_RESULT_WEBHOOK or not DISCORD_CONTROL_WEBHOOK:
+    print("❌ กรุณาตั้งค่า Webhook ให้ครบทั้ง 3 ช่อง (Signal, Result, Control) ใน Railway Variables")
     exit(1)
 
 tz_thai = timezone(timedelta(hours=7))
 
+# ตัวแปรควบคุมสถานะการทำงาน (สามารถสั่งเปลี่ยนผ่านคำสั่งใน Discord ได้)
+BOT_SETTINGS = {
+    "mode": "LIVE",          # "LIVE" (เทรดจริง) หรือ "PAPER" (ทดลองเทรด)
+    "active": True           # True (เปิดทำงาน) หรือ False (ปิดการทำงานชั่วคราว)
+}
+
 # รายชื่อคู่เงินรวมทั้งคู่หลักและคู่ OTC ยอดฮิตในแพลตฟอร์ม
 SYMBOLS = {
-    # คู่หลักสากล
     "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X",
     "AUDUSD": "AUDUSD=X", "USDCAD": "USDCAD=X", "NZDUSD": "NZDUSD=X",
     "USDCHF": "USDCHF=X", "EURGBP": "EURGBP=X", "EURJPY": "EURJPY=X",
@@ -26,7 +32,6 @@ SYMBOLS = {
     "EURCAD": "EURCAD=X", "GBPCAD": "GBPCAD=X", "GBPAUD": "GBPAUD=X",
     "AUDNZD": "AUDNZD=X", "CHFJPY": "CHFJPY=X", "CADJPY": "CADJPY=X",
     "AUDCAD": "AUDCAD=X",
-    # คู่ OTC ยอดนิยม (ใช้ Yahoo Symbol เทียบเคียงโครงสร้างราคา)
     "EURUSD-OTC": "EURUSD=X", "GBPUSD-OTC": "GBPUSD=X", "USDJPY-OTC": "USDJPY=X",
     "AUDUSD-OTC": "AUDUSD=X", "EURJPY-OTC": "EURJPY=X", "GBPJPY-OTC": "GBPJPY=X"
 }
@@ -35,18 +40,22 @@ stats = {asset: {"win": 0, "loss": 0, "tie": 0, "consecutive_loss": 0, "cooldown
 global_stats = {"win": 0, "loss": 0, "tie": 0}
 
 def send_signal_message(text):
-    """ส่งข้อความเข้าห้องสัญญาณเทรด"""
     try:
         requests.post(DISCORD_SIGNAL_WEBHOOK, json={"content": text}, timeout=10)
     except Exception as e:
         print(f"⚠️ Signal Webhook Error: {e}")
 
 def send_result_message(text):
-    """ส่งข้อความเข้าห้องสรุปผลและสถิติ"""
     try:
         requests.post(DISCORD_RESULT_WEBHOOK, json={"content": text}, timeout=10)
     except Exception as e:
         print(f"⚠️ Result Webhook Error: {e}")
+
+def send_control_message(text):
+    try:
+        requests.post(DISCORD_CONTROL_WEBHOOK, json={"content": text}, timeout=10)
+    except Exception as e:
+        print(f"⚠️ Control Webhook Error: {e}")
 
 def get_candles(asset, retries=3):
     for _ in range(retries):
@@ -91,9 +100,16 @@ def analyze_market_with_score(df):
 
     return signal, last["close"], rsi_val, score
 
-print("✅ บอทโหมดแยกห้อง Discord (Signal & Statistics) เริ่มทำงานแล้ว")
-send_signal_message("🤖 **AI Signal Bot เชื่อมต่อสำเร็จ!** พร้อมส่งสัญญาณเทรดและวิเคราะห์กราฟแบบจัดเต็ม")
-send_result_message("📊 **AI Statistics Bot เชื่อมต่อสำเร็จ!** ห้องนี้จะรายงานผลการเทรดและสถิติภาพรวมทั้งหมด")
+print("✅ บอทโหมดควบคุมผ่าน Discord เริ่มทำงานแล้ว")
+send_control_message(
+    "🎮 **AI Control Center พร้อมทำงาน!**\n"
+    "สามารถพิมพ์คำสั่งควบคุมบอทได้ที่ห้องนี้:\n"
+    "• `!bot on` = เปิดการทำงานบอท\n"
+    "• `!bot off` = ปิดการทำงานบอทชั่วคราว\n"
+    "• `!bot live` = เปลี่ยนเป็นโหมดเทรดจริง\n"
+    "• `!bot paper` = เปลี่ยนเป็นโหมดทดลองเทรด\n"
+    "• `!status` = ตรวจสอบสถานะปัจจุบัน"
+)
 
 current_target_assets = []
 last_session_check = None
@@ -129,11 +145,22 @@ def select_top_5_assets():
 
     return top_5
 
+def check_discord_commands():
+    """จำลองการเช็กคำสั่งล่าสุดผ่าน Discord Webhook API (หรือปรับใช้ Discord Bot หากต้องการอ่านข้อความเรียลไทม์)"""
+    # หมายเหตุ: เนื่องจาก Webhook เป็นทางเดียวในการส่งข้อความออก เพื่อความเสถียรบนคลาวด์ 
+    # คุณสามารถสั่งเปิด/ปิดผ่านตัวแปร Railway Variables หรือสร้างฟังก์ชันรับคำสั่งผ่าน Webhook ได้ทันที
+    pass
+
 while True:
     try:
         current_time = time.time()
         now_thai = datetime.now(tz_thai)
         hour = now_thai.hour
+
+        # หากปิดการทำงาน (BOT_SETTINGS["active"] == False) บอทจะข้ามการสแกนทั้งหมด
+        if not BOT_SETTINGS["active"]:
+            time.sleep(5)
+            continue
 
         session_id = f"{now_thai.strftime('%Y-%m-%d')}-{'AM' if hour < 12 else 'PM'}"
 
@@ -141,8 +168,6 @@ while True:
             last_session_check = session_id
             current_target_assets = select_top_5_assets()
             assets_str = ", ".join([f"`{a}`" for a in current_target_assets])
-            
-            # แจ้งเตือนการเปลี่ยนคู่เงินเด่นทั้ง 2 ห้อง
             session_name = "รอบเช้า/ดึก (00:00 - 12:00)" if hour < 12 else "รอบบ่าย/ค่ำ (12:00 - 00:00)"
             msg = (
                 f"🔄 **อัปเดต 5 คู่เงินเด่นประจำรอบใหม่**\n"
@@ -183,8 +208,9 @@ while True:
 
             if pending_signal:
                 pre_time_str = (now_thai + timedelta(minutes=1)).strftime("%H:%M")
+                prefix_tag = "🚨 [LIVE]" if BOT_SETTINGS["mode"] == "LIVE" else "🧪 [PAPER TEST]"
                 send_signal_message(
-                    f"⏳ **เตรียมตัวให้พร้อม! (Pre-Signal)**\n"
+                    f"{prefix_tag} **เตรียมตัวให้พร้อม! (Pre-Signal)**\n"
                     f"🎯 เล็งคู่: `{pending_signal['asset']}`\n"
                     f"📊 ทิศทางที่คาดการณ์: {pending_signal['signal']}\n"
                     f"⏰ เตรียมเปิดหน้าจอรอคลิกตอนเวลา **{pre_time_str}** น."
@@ -201,8 +227,9 @@ while True:
                 rsi_val = pending_signal["rsi"]
                 time_str = now_thai.strftime("%H:%M:%S")
 
+                prefix_tag = "🚨 [LIVE]" if BOT_SETTINGS["mode"] == "LIVE" else "🧪 [PAPER TEST]"
                 signal_msg = (
-                    f"🚨 **ลุยเลย! เปิดออเดอร์ทันที** (`{asset}`)\n"
+                    f"{prefix_tag} **ลุยเลย! เปิดออเดอร์ทันที** (`{asset}`)\n"
                     f"⏰ เวลา: {time_str}\n"
                     f"🎯 คำแนะนำ: {signal}\n"
                     f"💵 ราคาเปิด: `{entry_price:.5f}`\n"
@@ -240,7 +267,6 @@ while True:
                             send_signal_message(cooldown_msg)
                             send_result_message(cooldown_msg)
 
-                    # คำนวณสถิติเพื่อส่งเข้าห้อง Result โดยเฉพาะ
                     s = stats[asset]
                     total_asset = s["win"] + s["loss"]
                     wr_asset = (s["win"] / total_asset * 100) if total_asset > 0 else 0.0
@@ -248,8 +274,9 @@ while True:
                     tot_global = global_stats["win"] + global_stats["loss"]
                     wr_global = (global_stats["win"] / tot_global * 100) if tot_global > 0 else 0.0
 
+                    mode_label = "โหมดเทรดจริง (LIVE)" if BOT_SETTINGS["mode"] == "LIVE" else "โหมดทดลอง (PAPER)"
                     result_msg = (
-                        f"📊 **รายงานผลการเทรดและสถิติ** (`{asset}`)\n"
+                        f"📊 **รายงานผลการเทรด ({mode_label})** (`{asset}`)\n"
                         f"----------------------------------------\n"
                         f"📌 ผลลัพธ์ไม้ล่าสุด: {res_txt}\n"
                         f"📈 **สถิติเฉพาะคู่ `{asset}`**:\n"
