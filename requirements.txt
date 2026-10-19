@@ -1,4 +1,8 @@
-pandas
-numpy
-requests
-yfinance
+requests>=2.31.0
+pandas>=2.2.0
+numpy>=1.26.0
+yfinance>=0.2.44
+curl_cffi>=0.7.0
+lxml>=5.2.0
+pytz>=2024.1
+tzdata>=2024.1
