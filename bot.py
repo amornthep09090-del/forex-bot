@@ -6,7 +6,6 @@ import signal
 import threading
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import pandas as pd
@@ -23,10 +22,10 @@ DATA_DIR = os.getenv("DATA_DIR", "./data")
 DATA_DIR_IS_DEFAULT = "DATA_DIR" not in os.environ
 
 MAX_DATA_AGE_SEC = int(os.getenv("MAX_DATA_AGE_SEC", "240"))    # แท่งล่าสุดเก่าเกินนี้ = ข้อมูลไม่สด
-MIN_FRESH_RATIO = float(os.getenv("MIN_FRESH_RATIO", "0.5"))    # ต้องมีคู่เงินสดอย่างน้อยกี่ % ถึงถือว่าดึงข้อมูลได้
+MIN_FRESH_RATIO = float(os.getenv("MIN_FRESH_RATIO", "0.4"))    # ต้องมีคู่เงินสดอย่างน้อยกี่ % ถึงถือว่าดึงข้อมูลได้
 PAIR_COOLDOWN_SEC = int(os.getenv("PAIR_COOLDOWN_SEC", "180"))  # กันส่งคู่เดิมซ้ำถี่ ๆ
-FAIL_TO_PAUSE = int(os.getenv("FAIL_TO_PAUSE", "2"))
-OK_TO_RESUME = int(os.getenv("OK_TO_RESUME", "2"))
+FAIL_TO_PAUSE = int(os.getenv("FAIL_TO_PAUSE", "3"))
+OK_TO_RESUME = int(os.getenv("OK_TO_RESUME", "1"))
 SCAN_SECOND = 45                                                # วินาทีที่เริ่มสแกนล่วงหน้า
 
 NEWS_FILTER = os.getenv("NEWS_FILTER", "1") == "1"
@@ -37,12 +36,12 @@ NEWS_BRIEF_ON_BOOT = os.getenv("NEWS_BRIEF_ON_BOOT", "0") == "1"
 
 # --- ตัวโมเดลเรียนรู้ ---
 PAYOUT = float(os.getenv("PAYOUT", "0.85"))                     # ผลตอบแทนของโบรกต่อไม้ที่ชนะ (ไว้คำนวณจุดคุ้มทุน)
-WARMUP_SAMPLES = int(os.getenv("WARMUP_SAMPLES", "600"))        # เรียนรู้ให้ครบกี่ตัวอย่างก่อนเริ่มออกสัญญาณ
+WARMUP_SAMPLES = int(os.getenv("WARMUP_SAMPLES", "500"))        # เรียนรู้ให้ครบกี่ตัวอย่างก่อนเริ่มออกสัญญาณ
 LEARNING_RATE = float(os.getenv("LEARNING_RATE", "0.002"))
-MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.52"))     # ความมั่นใจขั้นต่ำ (0.52 = 52%)
-TOP_PERCENT = float(os.getenv("TOP_PERCENT", "15"))             # ออกเฉพาะนาทีที่ความมั่นใจอยู่ใน Top x% ของที่ผ่านมา (100 = ออกทุกนาที)
+MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.53"))     # ความมั่นใจขั้นต่ำ (0.53 = 53%)
+TOP_PERCENT = float(os.getenv("TOP_PERCENT", "15"))             # ออกเฉพาะนาทีที่ความมั่นใจอยู่ใน Top x% ของที่ผ่านมา
 REQUIRE_EDGE = os.getenv("REQUIRE_EDGE", "0") == "1"            # 1 = ออกสัญญาณเมื่อวัดผลย้อนหลังแล้วโมเดลเหนือจุดคุ้มทุนเท่านั้น
-MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.00001"))        # กรองตลาดนิ่งเกินไป
+MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.00003"))        # กรองตลาดนิ่งเกินไป
 
 if not DISCORD_MAIN_WEBHOOK or not DISCORD_RESULT_WEBHOOK:
     print("❌ กรุณาตั้งค่า DISCORD_MAIN_WEBHOOK และ DISCORD_RESULT_WEBHOOK ใน Railway Variables")
@@ -69,6 +68,10 @@ global_stats = {"win": 0, "loss": 0, "tie": 0}
 last_signal_time = {}
 stats_lock = threading.Lock()
 trade_log_lock = threading.Lock()
+
+# Cache ข้อมูลราคากลาง เพื่อลดการยิง API ซ้ำซ้อนจากเธรดประเมินผล
+DATA_CACHE = {}
+CACHE_LOCK = threading.Lock()
 
 DIR_TEXT = {"BUY": "🟢 BUY (CALL)", "SELL": "🔴 SELL (PUT)"}
 COLOR_GREEN, COLOR_RED, COLOR_GRAY, COLOR_ORANGE, COLOR_BLUE = 0x2ECC71, 0xE74C3C, 0x95A5A6, 0xF39C12, 0x3498DB
@@ -139,19 +142,37 @@ def broadcast(embed):
     send_result(embed=embed)
 
 
-# ======================= ดึงข้อมูลราคา =======================
+# ======================= ดึงข้อมูลราคา (เสถียร + ไม่โดนบล็อก) =======================
+def _clean_df(df):
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.rename(columns=str.lower)
+    req = ["open", "high", "low", "close"]
+    if not all(c in df.columns for c in req):
+        return None
+    df = df[req].dropna(how="any")
+    if df.empty:
+        return None
+    df = df.astype(float)
+    idx = df.index
+    df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+    df.index = df.index.floor("min")
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df if len(df) >= 35 else None
+
+
 def get_candles(symbol_code, retries=2):
+    """ดึงรายตัว (ใช้เฉพาะตอน Fallback หรือตอนตรวจผลไม้ที่ตกค้าง)"""
     for i in range(retries):
         try:
-            df = yf.Ticker(symbol_code).history(period="2d", interval="1m")
-            if df is not None and not df.empty:
-                df = df.rename(columns=str.lower)
-                idx = df.index
-                df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
-                df = df[["open", "high", "low", "close"]].astype(float).dropna()
-                df = df[~df.index.duplicated(keep="last")]
-                if len(df) >= 15:
-                    return df
+            df = yf.Ticker(symbol_code).history(period="2d", interval="1m", timeout=10)
+            df = _clean_df(df)
+            if df is not None:
+                with CACHE_LOCK:
+                    DATA_CACHE[symbol_code] = df
+                return df
         except Exception as e:
             print(f"⚠️ get_candles {symbol_code}: {e}")
         time.sleep(1 + i)
@@ -159,20 +180,56 @@ def get_candles(symbol_code, retries=2):
 
 
 def fetch_all(tickers):
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        results = list(ex.map(get_candles, tickers))
-    return dict(zip(tickers, results))
+    """ดึงข้อมูลทุกคู่พร้อมกันใน Batch เดียว เร็วและลดโอกาสโดน Yahoo บล็อก 95%"""
+    out = {}
+    try:
+        raw = yf.download(
+            tickers=tickers,
+            period="2d",
+            interval="1m",
+            group_by="ticker",
+            threads=True,
+            progress=False,
+            timeout=15
+        )
+        if raw is not None and not raw.empty:
+            if len(tickers) == 1:
+                t = tickers[0]
+                df = _clean_df(raw)
+                if df is not None:
+                    out[t] = df
+            else:
+                lvl0 = set(raw.columns.get_level_values(0))
+                for t in tickers:
+                    if t in lvl0:
+                        df = _clean_df(raw[t])
+                        if df is not None:
+                            out[t] = df
+    except Exception as e:
+        print(f"⚠️ Batch download error: {e}")
+
+    # หากคู่ไหนตกหล่นใน Batch ให้ตามเก็บรายตัวไม่เกิน 5 คู่ต่อรอบ
+    missing = [t for t in tickers if t not in out]
+    for t in missing[:5]:
+        df = get_candles(t, retries=1)
+        if df is not None:
+            out[t] = df
+
+    with CACHE_LOCK:
+        for k, v in out.items():
+            DATA_CACHE[k] = v
+        return dict(DATA_CACHE)
 
 
 def is_fresh(df, now_utc=None):
     """ข้อมูลต้อง 'สด' และ 'ราคาขยับ' ไม่ใช่ข้อมูลค้างจากตลาดปิด"""
-    if df is None or len(df) < 15:
+    if df is None or len(df) < 35:
         return False
     now_utc = now_utc or pd.Timestamp.now(tz="UTC")
     age = (now_utc - df.index[-1]).total_seconds()
     if age > MAX_DATA_AGE_SEC:
         return False
-    if df["close"].tail(15).nunique() <= 1:
+    if df["close"].tail(15).nunique() <= 2:
         return False
     return True
 
@@ -190,8 +247,8 @@ def market_closed_by_calendar(now_utc):
 
 # ======================= ข่าวเศรษฐกิจ =======================
 NEWS_URLS = [
-    "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",
     "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+    "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",
 ]
 NEWS_REFRESH_SEC = 3 * 3600
 NEWS_RETRY_SEC = 900
@@ -207,9 +264,13 @@ def _parse_event_time(s):
 
 def fetch_news_calendar():
     last_err = None
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
     for url in NEWS_URLS:
         try:
-            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            r = requests.get(url, headers=headers, timeout=15)
             r.raise_for_status()
             out = []
             for e in r.json():
@@ -331,23 +392,34 @@ def build_news_embed(now_utc):
     return make_embed(title, COLOR_RED if high else COLOR_GREEN, desc, fields, footer)
 
 
-# ======================= ฟีเจอร์ + โมเดลเรียนรู้ออนไลน์ =======================
-FEATURES = ["z", "rsi7", "rsi14", "ret1", "ret3", "trend", "dist50", "wick", "streak"]
-# น้ำหนักตั้งต้น = กลยุทธ์เด้งกลับแบบอ่อน ๆ (Bollinger/RSI) แล้วให้โมเดลปรับเองจากผลจริง
-PRIOR_W = np.array([-0.08, -0.05, -0.03, -0.03, -0.03, 0.0, 0.0, 0.03, -0.02])
-L2_PULL = 0.02
+# ======================= ฟีเจอร์ (12 ตัวชี้วัด) + โมเดลเรียนรู้ออนไลน์ =======================
+FEATURES = [
+    "z", "bb_pos", "rsi7", "rsi14", "stoch_k",
+    "ret1", "ret3", "wick", "streak",
+    "trend", "dist50", "macd_h"
+]
+# น้ำหนักตั้งต้น = กลยุทธ์ Mean-Reversion (เด้งกลับเมื่อ Overbought/Oversold + ไส้เทียนปฏิเสธราคา)
+PRIOR_W = np.array([
+    -0.07, -0.06, -0.05, -0.03, -0.04,
+    -0.03, -0.02,  0.05, -0.02,
+     0.01, -0.01,  0.02
+])
+L2_PULL = 0.015
 GUARD_TAGS = ["against_trend", "streak_against", "vol_spike", "quiet_session", "near_news"]
 
 FEATURE_TEXT = {
-    "z": ("ราคาสูงกว่าค่าเฉลี่ยมาก (Bollinger)", "ราคาต่ำกว่าค่าเฉลี่ยมาก (Bollinger)"),
-    "rsi7": ("RSI(7) สูง", "RSI(7) ต่ำ"),
+    "z": ("ราคาพุ่งทะลุค่าเฉลี่ย (Z-Score)", "ราคาร่วงหลุดค่าเฉลี่ย (Z-Score)"),
+    "bb_pos": ("ชนกรอบบน Bollinger Band", "ชนกรอบล่าง Bollinger Band"),
+    "rsi7": ("RSI(7) เข้าเขตซื้อมากเกินไป", "RSI(7) เข้าเขตขายมากเกินไป"),
     "rsi14": ("RSI(14) สูง", "RSI(14) ต่ำ"),
+    "stoch_k": ("Stochastic สูงสุดขีด", "Stochastic ต่ำสุดขีด"),
     "ret1": ("แท่งปัจจุบันพุ่งแรง", "แท่งปัจจุบันร่วงแรง"),
     "ret3": ("3 แท่งล่าสุดขึ้นต่อเนื่อง", "3 แท่งล่าสุดลงต่อเนื่อง"),
+    "wick": ("ไส้เทียนล่างยาว (มีแรงซื้อดันกลับ)", "ไส้เทียนบนยาว (มีแรงขายตบลง)"),
+    "streak": ("แท่งเขียวติดต่อกัน", "แท่งแดงติดต่อกัน"),
     "trend": ("เทรนด์ขาขึ้น (EMA20>EMA50)", "เทรนด์ขาลง (EMA20<EMA50)"),
-    "dist50": ("ราคาอยู่เหนือ EMA50 มาก", "ราคาอยู่ใต้ EMA50 มาก"),
-    "wick": ("ไส้เทียนล่างยาว (แรงซื้อรับ)", "ไส้เทียนบนยาว (แรงขายกด)"),
-    "streak": ("แท่งเขียวติดกัน", "แท่งแดงติดกัน"),
+    "dist50": ("ราคาห่างเหนือ EMA50 มาก", "ราคาห่างใต้ EMA50 มาก"),
+    "macd_h": ("โมเมนตัม MACD หนุนขาขึ้น", "โมเมนตัม MACD หนุนขาลง"),
 }
 TAG_SHORT = {
     "against_trend": "สวนเทรนด์",
@@ -369,10 +441,10 @@ class OnlineModel:
         self.w = PRIOR_W.copy()
         self.b = 0.0
         self.n = 0
-        self.acc_all = deque(maxlen=3000)   # ทายถูกไหม (ทุกคู่ทุกนาที ก่อนเรียนรู้จากตัวอย่างนั้น)
-        self.acc_hc = deque(maxlen=1000)    # เฉพาะที่ความมั่นใจ >= MIN_CONFIDENCE
+        self.acc_all = deque(maxlen=3000)
+        self.acc_hc = deque(maxlen=1000)
         self.tag_hist = {t: deque(maxlen=1000) for t in GUARD_TAGS}
-        self.conf_hist = deque(maxlen=500)  # ความมั่นใจสูงสุดของแต่ละนาที
+        self.conf_hist = deque(maxlen=500)
 
     def predict(self, x):
         z = float(self.w @ x + self.b)
@@ -401,6 +473,9 @@ class OnlineModel:
             w = np.array(d.get("w", []), dtype=float)
             if w.shape == PRIOR_W.shape:
                 self.w = w
+            else:
+                print("ℹ️ โครงสร้างฟีเจอร์อัปเกรดเป็น 12 ตัวชี้วัด เริ่มตั้งต้นค่าน้ำหนักใหม่โดยคงสถิติเดิม")
+                self.w = PRIOR_W.copy()
             self.b = float(d.get("b", 0.0))
             self.n = int(d.get("n", 0))
             self.acc_all = deque(d.get("acc_all", []), maxlen=3000)
@@ -411,51 +486,69 @@ class OnlineModel:
 
 
 model = OnlineModel()
-pending_labels = []      # ภาพถ่ายฟีเจอร์ที่รอเฉลยว่าแท่งถัดไปขึ้นหรือลง
+pending_labels = []
 app_state = {"last_weekly": None}
 
 
-def _rsi(close, n):
+def _rsi_wilder(close, n):
+    """คำนวณ RSI ตามมาตรฐาน Wilder's Smoothing (ตรงกับ TradingView)"""
     delta = close.diff()
-    gain = delta.clip(lower=0).rolling(n).mean().iloc[-1]
-    loss = (-delta.clip(upper=0)).rolling(n).mean().iloc[-1]
+    gain = delta.clip(lower=0).ewm(alpha=1.0 / n, min_periods=n, adjust=False).mean().iloc[-1]
+    loss = (-delta.clip(upper=0)).ewm(alpha=1.0 / n, min_periods=n, adjust=False).mean().iloc[-1]
     if not (np.isfinite(gain) and np.isfinite(loss)):
         return None
     if loss == 0:
         return 100.0 if gain > 0 else 50.0
-    return float(100 - 100 / (1 + gain / loss))
+    return float(100.0 - (100.0 / (1.0 + gain / loss)))
 
 
 def compute_features(df):
-    """คำนวณฟีเจอร์จากแท่งเทียน 1 นาที (แท่งสุดท้าย = แท่งที่กำลังวิ่งอยู่ ณ วินาทีที่ 45)"""
+    """คำนวณฟีเจอร์จากแท่งเทียน 1 นาที (แท่งสุดท้าย iloc[-1] คือแท่งปัจจุบัน ณ วินาทีที่ 45)"""
     d = df.tail(120)
-    if len(d) < 60:
+    if len(d) < 35:
         return None
     o, h, l, c = d["open"], d["high"], d["low"], d["close"]
     pc = c.shift(1)
     tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
-    atr14 = tr.rolling(14).mean().iloc[-1]
-    atr5 = tr.rolling(5).mean().iloc[-1]
-    atr30 = tr.rolling(30).mean().iloc[-1]
+    atr14 = tr.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean().iloc[-1]
+    atr5 = tr.ewm(alpha=1.0 / 5, min_periods=5, adjust=False).mean().iloc[-1]
+    atr30 = tr.ewm(alpha=1.0 / 30, min_periods=25, adjust=False).mean().iloc[-1]
     if not (np.isfinite(atr14) and atr14 > 0 and np.isfinite(atr30) and atr30 > 0 and np.isfinite(atr5)):
         return None
-    sd = c.rolling(15).std().iloc[-1]
-    sma = c.rolling(15).mean().iloc[-1]
-    if not (np.isfinite(sd) and sd > 0 and np.isfinite(sma)):
+
+    sd20 = c.rolling(20).std().iloc[-1]
+    sma20 = c.rolling(20).mean().iloc[-1]
+    if not (np.isfinite(sd20) and sd20 > 0 and np.isfinite(sma20)):
         return None
-    rsi7, rsi14 = _rsi(c, 7), _rsi(c, 14)
+
+    rsi7, rsi14 = _rsi_wilder(c, 7), _rsi_wilder(c, 14)
     if rsi7 is None or rsi14 is None:
         return None
 
     last = float(c.iloc[-1])
+    z = (last - sma20) / sd20
+    bb_pos = (last - sma20) / (2.0 * sd20)  # +1 = ชนกรอบบน, -1 = ชนกรอบล่าง
+
+    # Stochastic %K (14)
+    low14 = l.rolling(14).min().iloc[-1]
+    high14 = h.rolling(14).max().iloc[-1]
+    stoch_k = ((last - low14) / (high14 - low14) * 100.0) if (high14 > low14) else 50.0
+
+    # EMA & MACD Histogram
     ema20 = float(c.ewm(span=20, adjust=False).mean().iloc[-1])
     ema50 = float(c.ewm(span=50, adjust=False).mean().iloc[-1])
+    ema12_s = c.ewm(span=12, adjust=False).mean()
+    ema26_s = c.ewm(span=26, adjust=False).mean()
+    macd_line = ema12_s - ema26_s
+    macd_sig = macd_line.ewm(span=9, adjust=False).mean()
+    macd_h = float((macd_line.iloc[-1] - macd_sig.iloc[-1]) / atr14)
 
-    ob, hb, lb, cb = float(o.iloc[-2]), float(h.iloc[-2]), float(l.iloc[-2]), float(c.iloc[-2])
+    # ใช้แท่งปัจจุบัน (iloc[-1] ณ วินาทีที่ 45) คำนวณไส้เทียนและลูกติดเพื่อให้ทันจังหวะเข้าไม้
+    ob, hb, lb, cb = float(o.iloc[-1]), float(h.iloc[-1]), float(l.iloc[-1]), float(c.iloc[-1])
     rng = hb - lb
     wick = ((min(ob, cb) - lb) - (hb - max(ob, cb))) / rng if rng > 0 else 0.0
 
-    dirs = np.sign((c - o).iloc[-2::-1].values)
+    dirs = np.sign((c - o).iloc[::-1].values)
     streak = 0
     if len(dirs) and dirs[0] != 0:
         first = dirs[0]
@@ -467,15 +560,19 @@ def compute_features(df):
         streak = int(first) * min(streak, 6)
 
     raw = {
-        "z": float((last - sma) / sd),
-        "rsi7": float(rsi7), "rsi14": float(rsi14),
-        "ret1": float((last - float(o.iloc[-1])) / atr14),
+        "z": float(z),
+        "bb_pos": float(bb_pos),
+        "rsi7": float(rsi7),
+        "rsi14": float(rsi14),
+        "stoch_k": float(stoch_k),
+        "ret1": float((cb - ob) / atr14),
         "ret3": float((last - float(c.iloc[-4])) / atr14),
-        "trend": float((ema20 - ema50) / atr14),
-        "dist50": float((last - ema50) / atr14),
         "wick": float(wick),
         "streak": int(streak),
-        "volratio": float(atr5 / atr30 - 1),
+        "trend": float((ema20 - ema50) / atr14),
+        "dist50": float((last - ema50) / atr14),
+        "macd_h": float(macd_h),
+        "volratio": float(atr5 / atr30 - 1.0),
         "atr_abs": float(atr14),
         "atr_pct": float(atr14 / last) if last else 0.0,
         "price": last,
@@ -488,15 +585,18 @@ def compute_features(df):
 
 def to_vector(raw):
     return np.array([
-        np.clip(raw["z"], -3, 3),
-        (raw["rsi7"] - 50) / 25,
-        (raw["rsi14"] - 50) / 25,
-        np.clip(raw["ret1"], -3, 3),
-        np.clip(raw["ret3"], -3, 3),
-        np.clip(raw["trend"], -3, 3),
-        np.clip(raw["dist50"], -3, 3),
-        raw["wick"],
-        np.clip(raw["streak"] / 3, -2, 2),
+        np.clip(raw["z"], -3.0, 3.0),
+        np.clip(raw["bb_pos"], -1.5, 1.5),
+        (raw["rsi7"] - 50.0) / 25.0,
+        (raw["rsi14"] - 50.0) / 25.0,
+        (raw["stoch_k"] - 50.0) / 25.0,
+        np.clip(raw["ret1"], -3.0, 3.0),
+        np.clip(raw["ret3"], -3.0, 3.0),
+        np.clip(raw["wick"], -1.0, 1.0),
+        np.clip(raw["streak"] / 3.0, -2.0, 2.0),
+        np.clip(raw["trend"], -3.0, 3.0),
+        np.clip(raw["dist50"], -3.0, 3.0),
+        np.clip(raw["macd_h"], -2.0, 2.0),
     ], dtype=float)
 
 
@@ -528,11 +628,11 @@ def why_text(x, direction):
             break
         pos, neg = FEATURE_TEXT[FEATURES[i]]
         parts.append(pos if x[i] > 0 else neg)
-    return " · ".join(parts) if parts else "ความได้เปรียบเล็กน้อย ไม่มีปัจจัยเด่น"
+    return " · ".join(parts) if parts else "ความได้เปรียบเชิงสถิติจากโมเดล"
 
 
 def make_candidates(data, scan_min, now_utc):
-    """ทายทุกคู่ที่ข้อมูลสด + เก็บภาพถ่ายไว้รอเฉลย (ใช้เรียนรู้ได้ ~19 ตัวอย่างต่อนาที)"""
+    """ทายทุกคู่ที่ข้อมูลสด + เก็บภาพถ่ายไว้รอเฉลย"""
     cands = []
     entry_time = scan_min + pd.Timedelta(minutes=1)
     for asset, code in STANDARD_SYMBOLS.items():
@@ -545,11 +645,11 @@ def make_candidates(data, scan_min, now_utc):
         x = to_vector(raw)
         p = model.predict(x)
         direction = "BUY" if p >= 0.5 else "SELL"
-        conf = p if p >= 0.5 else 1 - p
+        conf = p if p >= 0.5 else 1.0 - p
         tags = pre_tags(raw, direction, asset, entry_time)
         pending_labels.append({
             "asset": asset, "scan_min": scan_min, "x": x, "p": p, "conf": conf,
-            "dir": direction, "tags": tags,
+            "dir": direction, "tags": tags, "atr_abs": raw["atr_abs"],
         })
         cands.append({
             "asset": asset, "dir": direction, "conf": conf, "x": x, "raw": raw,
@@ -559,7 +659,7 @@ def make_candidates(data, scan_min, now_utc):
 
 
 def learn_from_pending(data, now_utc):
-    """เฉลยตัวอย่างเก่า (แท่งถัดไปขึ้น/ลง) แล้วให้โมเดลเรียนรู้"""
+    """เฉลยตัวอย่างเก่า (แท่งถัดไปขึ้น/ลง) โดยกรองแท่ง Doji ที่ไร้ทิศทางออกไม่ให้นำไปเทรนเสียศูนย์"""
     global pending_labels
     keep, trained = [], 0
     one_min = pd.Timedelta(minutes=1)
@@ -569,12 +669,13 @@ def learn_from_pending(data, now_utc):
         if age > 600:
             continue
         df = data.get(STANDARD_SYMBOLS[s["asset"]])
-        if df is None or target not in df.index or not ((target + one_min) in df.index or age >= 150):
+        if df is None or target not in df.index or not ((target + one_min) in df.index or age >= 125):
             keep.append(s)
             continue
         row = df.loc[target]
         o, c = float(row["open"]), float(row["close"])
-        if c == o:
+        # กรองแท่ง Doji หรือแท่งที่ราคาขยับน้อยกว่า 5% ของ ATR ออกเพื่อไม่ให้โมเดลจำ Noise
+        if abs(c - o) < s.get("atr_abs", 0.0) * 0.05:
             continue
         y = 1.0 if c > o else 0.0
         correct = 1 if (s["p"] >= 0.5) == (y == 1.0) else 0
@@ -595,18 +696,18 @@ def edge_status():
     """(ผ่านเกณฑ์ไหม, ความแม่นยำของที่ความมั่นใจสูง, จำนวนตัวอย่าง)"""
     with model.lock:
         hc = list(model.acc_hc)
-    if len(hc) < 200:
+    if len(hc) < 150:
         return True, None, len(hc)
     acc = sum(hc) / len(hc)
     return acc >= breakeven(), acc, len(hc)
 
 
 def guard_blocks(tags):
-    """ถ้าเงื่อนไขไหนโมเดลทายผิดบ่อยจากข้อมูลจริง (>53% ผิด จาก >=400 ตัวอย่าง) ให้หลีกเลี่ยง"""
+    """ถ้าเงื่อนไขไหนโมเดลทายผิดบ่อยจากข้อมูลจริง (>52% ผิด จาก >=250 ตัวอย่าง) ให้หลีกเลี่ยง"""
     with model.lock:
         for t in tags:
             h = model.tag_hist.get(t)
-            if h is not None and len(h) >= 400 and (sum(h) / len(h)) <= 0.47:
+            if h is not None and len(h) >= 250 and (sum(h) / len(h)) <= 0.48:
                 return t
     return None
 
@@ -627,6 +728,10 @@ def select_best(cands, scan_min):
         if c["raw"]["atr_pct"] < MIN_ATR_PCT:
             continue
         if guard_blocks(c["tags"]):
+            continue
+        # กรองพิเศษ: ห้ามสวนแท่งที่กำลังพุ่งทะลุ 2.2 ATR ในแท่งเดียว (ป้องกันการรับมีดตอนราคาไหลแรง)
+        sgn = 1 if c["dir"] == "BUY" else -1
+        if c["raw"]["ret1"] * sgn < -2.2:
             continue
         best = c
         break
@@ -737,8 +842,8 @@ def analyze_loss(order, open_p, close_p):
     raw = order["raw"]
     atr = raw["atr_abs"]
     sgn = 1 if order["dir"] == "BUY" else -1
-    move = (close_p - open_p) / atr           # ระยะที่แท่งวิ่ง (หน่วย ATR)
-    against = -sgn * move                     # ค่าบวก = วิ่งสวนทิศที่เราเลือก
+    move = (close_p - open_p) / atr
+    against = -sgn * move
 
     tags = list(order["tags"])
     if order["conf"] < 0.55:
@@ -789,21 +894,32 @@ def evaluate_trade_background(order, signal_min):
     asset, signal = order["asset"], order["dir"]
     symbol_code = STANDARD_SYMBOLS[asset]
     try:
-        close_at = signal_min + pd.Timedelta(minutes=1, seconds=8)
+        close_at = signal_min + pd.Timedelta(minutes=1, seconds=10)
         while pd.Timestamp.now(tz="UTC") < close_at:
             time.sleep(1)
 
         deadline = signal_min + pd.Timedelta(minutes=5)
         next_min = signal_min + pd.Timedelta(minutes=1)
         eval_c = None
+
         while pd.Timestamp.now(tz="UTC") < deadline:
-            res_df = get_candles(symbol_code, retries=2)
-            if res_df is not None and signal_min in res_df.index:
-                waited = (pd.Timestamp.now(tz="UTC") - close_at).total_seconds()
-                if next_min in res_df.index or waited >= 90:
-                    eval_c = res_df.loc[signal_min]
+            # 1. เช็กจาก DATA_CACHE ก่อนเพื่อไม่ให้ยิง API ซ้ำซ้อน
+            with CACHE_LOCK:
+                cached_df = DATA_CACHE.get(symbol_code)
+            if cached_df is not None and signal_min in cached_df.index:
+                if next_min in cached_df.index:
+                    eval_c = cached_df.loc[signal_min]
                     break
-            time.sleep(10)
+
+            # 2. ถ้ารอนานเกิน 50 วินาทีหลังปิดแท่งแล้วยังไม่อัปเดต ค่อยดึงเดี่ยว
+            waited = (pd.Timestamp.now(tz="UTC") - close_at).total_seconds()
+            if waited >= 50:
+                res_df = get_candles(symbol_code, retries=1)
+                if res_df is not None and signal_min in res_df.index:
+                    if next_min in res_df.index or waited >= 95:
+                        eval_c = res_df.loc[signal_min]
+                        break
+            time.sleep(8)
 
         if eval_c is None:
             send_result(embed=make_embed(
@@ -1031,17 +1147,22 @@ def main():
     if DATA_DIR_IS_DEFAULT:
         print("⚠️ ไม่ได้ตั้ง DATA_DIR — ถ้าไม่ผูก Railway Volume ข้อมูลที่เรียนรู้/ประวัติไม้จะหายเมื่อ Redeploy")
 
+    stop_event = threading.Event()
+
     def _graceful(*_):
+        print("🛑 กำลังบันทึกข้อมูลก่อนปิดระบบ...")
+        stop_event.set()
         save_all()
-        os._exit(0)
+        raise SystemExit(0)
 
     try:
         signal.signal(signal.SIGTERM, _graceful)
+        signal.signal(signal.SIGINT, _graceful)
     except Exception:
         pass
 
     print("✅ บอทพร้อมใช้งานแล้ว")
-    send_main(f"🌐 **Main Bot พร้อมทำงาน** · run `{BOOT_ID}` · 🧠 เรียนรู้แล้ว {model.n:,} ตัวอย่าง")
+    send_main(f"🌐 **Main Bot พร้อมทำงาน (อัปเกรด 12 ฟีเจอร์ + Batch Fetch)** · run `{BOOT_ID}` · 🧠 เรียนรู้แล้ว {model.n:,} ตัวอย่าง")
     send_result(f"🏆 **Stats Bot พร้อมรายงานผล** · run `{BOOT_ID}`")
     if DISCORD_NEWS_WEBHOOK:
         send_news(f"📰 **ช่องวิเคราะห์พร้อมแล้ว** · สรุปข่าวจันทร์–ศุกร์ {NEWS_BRIEF_HOUR:02d}:00 น. · วิเคราะห์ไม้แพ้ทุกไม้ · run `{BOOT_ID}`")
@@ -1069,13 +1190,13 @@ def main():
             print("▶️ กลับมาทำงาน")
             broadcast(make_embed("▶️ บอทกลับมาทำงานแล้ว", COLOR_GREEN, "ข้อมูลตลาดพร้อมใช้งานปกติ"))
 
-    while True:
+    while not stop_event.is_set():
         try:
             now_utc = pd.Timestamp.now(tz="UTC")
             current_min = now_utc.floor("min")
             current_sec = now_utc.second
 
-            # 1. สแกนล่วงหน้า
+            # 1. สแกนล่วงหน้า ณ วินาทีที่ 45
             if current_sec >= SCAN_SECOND and last_pre_scan != current_min:
                 last_pre_scan = current_min
                 pending_order = None
@@ -1107,7 +1228,7 @@ def main():
                                 send_main(f"🧠 กำลังเรียนรู้ก่อนเริ่มออกสัญญาณ ({model.n}/{WARMUP_SAMPLES} ตัวอย่าง)")
                             if ready and not announce["ready"]:
                                 announce["ready"] = True
-                                send_main("✅ เรียนรู้ครบแล้ว เริ่มเลือกออเดอร์ที่มั่นใจที่สุดทุกนาที")
+                                send_main("✅ เรียนรู้ครบแล้ว เริ่มคัดเลือกออเดอร์ที่มั่นใจที่สุด")
 
                             if ready:
                                 ok_edge, acc, n_hc = edge_status()
@@ -1132,14 +1253,14 @@ def main():
                         print(f"⚠️ ข้อมูลสดแค่ {fresh_n}/{len(UNIQUE_TICKERS)} คู่ (ครั้งที่ {health['fail']})")
                         if health["fail"] >= FAIL_TO_PAUSE:
                             pause(f"ดึงข้อมูลตลาดไม่ได้/ข้อมูลไม่อัปเดต (สดแค่ {fresh_n}/{len(UNIQUE_TICKERS)} คู่)")
-                        health["skip"] = min(2 ** (health["fail"] - 1) - 1, 4)
+                        health["skip"] = min(2 ** (health["fail"] - 1) - 1, 3)
 
                 if pending_order is not None:
                     pre_time_str = (current_min + pd.Timedelta(minutes=1)).tz_convert(tz_thai).strftime("%H:%M")
                     p = pending_order
                     send_main(f"⏳ **{p['asset']}** · {DIR_TEXT[p['dir']]} · มั่นใจ **{p['conf'] * 100:.0f}%** · เตรียมกด **{pre_time_str}**")
 
-            # 2. วินาทีที่ 1: ส่งสัญญาณจริง
+            # 2. วินาทีที่ 1 ของนาทีถัดไป: ส่งสัญญาณเข้าออเดอร์จริง
             if (
                 current_sec >= 1
                 and last_action_min != current_min
@@ -1178,6 +1299,8 @@ def main():
                 pending_minute = None
 
             time.sleep(0.5)
+        except SystemExit:
+            break
         except Exception as e:
             print(f"⚠️ Loop Error: {e}")
             time.sleep(5)
