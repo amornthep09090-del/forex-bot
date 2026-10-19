@@ -20,8 +20,8 @@ DISCORD_NEWS_WEBHOOK = os.getenv("DISCORD_NEWS_WEBHOOK", "").strip()
 DATA_DIR = os.getenv("DATA_DIR", "./data")
 DATA_DIR_IS_DEFAULT = "DATA_DIR" not in os.environ
 
-MAX_DATA_AGE_SEC = int(os.getenv("MAX_DATA_AGE_SEC", "300"))    # ยืดหยุ่นให้ข้อมูล Yahoo ดีเลย์ได้ถึง 5 นาที
-MIN_FRESH_RATIO = float(os.getenv("MIN_FRESH_RATIO", "0.35"))   # ขอแค่ 35% ของคู่เงินขยับก็ทำงานต่อได้ (กันค้างช่วงเช้า)
+MAX_DATA_AGE_SEC = int(os.getenv("MAX_DATA_AGE_SEC", "300"))
+MIN_FRESH_RATIO = float(os.getenv("MIN_FRESH_RATIO", "0.35"))
 PAIR_COOLDOWN_SEC = int(os.getenv("PAIR_COOLDOWN_SEC", "180"))
 FAIL_TO_PAUSE = int(os.getenv("FAIL_TO_PAUSE", "3"))
 OK_TO_RESUME = int(os.getenv("OK_TO_RESUME", "1"))
@@ -156,7 +156,7 @@ def _clean_df(df):
     df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
     df.index = df.index.floor("min")
     df = df[~df.index.duplicated(keep="last")].sort_index()
-    # แก้ปัญหา Yahoo Finance ให้ค่า Open == Close ในกราฟ 1 นาที โดยใช้ราคาปิดแท่งก่อนหน้าเป็นราคาเปิดแทน
+    
     prev_c = df["close"].shift(1)
     same_oc = (df["open"] == df["close"]) & prev_c.notna()
     df.loc[same_oc, "open"] = prev_c[same_oc]
@@ -618,7 +618,6 @@ def why_text(x, direction):
 
 
 def warmup_from_history(data):
-    """เรียนรู้จากกราฟย้อนหลังทันทีเมื่อเปิดบอท ไม่ต้องนั่งรอทีละนาที"""
     if model.n >= WARMUP_SAMPLES:
         return 0
     added = 0
@@ -626,7 +625,6 @@ def warmup_from_history(data):
         df = data.get(code)
         if df is None or len(df) < 100:
             continue
-        # วนเรียนรู้จาก 45 แท่งล่าสุดของแต่ละคู่เงิน (19 คู่ x 45 ≈ 855 ตัวอย่าง)
         for idx_pos in range(len(df) - 46, len(df) - 1):
             sub = df.iloc[:idx_pos + 1]
             nxt = df.iloc[idx_pos + 1]
@@ -688,7 +686,6 @@ def make_candidates(data, scan_min, now_utc):
 
 
 def learn_from_pending(data, now_utc):
-    """เฉลยตัวอย่างเก่า รองรับกรณี Yahoo ให้ Open == Close โดยเทียบกับราคาปิดแท่งก่อนหน้า"""
     global pending_labels
     keep, trained = [], 0
     one_min = pd.Timedelta(minutes=1)
@@ -915,44 +912,45 @@ def analyze_loss(order, open_p, close_p):
     return tags, move, against, lines, learn
 
 
-# ======================= ประเมินผล (เธรดเบื้องหลัง) =======================
+# ======================= ประเมินผล (แก้ดีเลย์ แจ้งผลไว) =======================
 def evaluate_trade_background(order, signal_min):
     asset, signal = order["asset"], order["dir"]
     symbol_code = STANDARD_SYMBOLS[asset]
     try:
-        close_at = signal_min + pd.Timedelta(minutes=1, seconds=10)
+        close_at = signal_min + pd.Timedelta(minutes=1, seconds=2)
         while pd.Timestamp.now(tz="UTC") < close_at:
-            time.sleep(1)
+            time.sleep(0.5)
 
-        deadline = signal_min + pd.Timedelta(minutes=5)
+        deadline = signal_min + pd.Timedelta(minutes=2, seconds=30)
         next_min = signal_min + pd.Timedelta(minutes=1)
         eval_c = None
+        open_p = float(order.get("price", 0.0))
+        close_p = None
 
         while pd.Timestamp.now(tz="UTC") < deadline:
-            with CACHE_LOCK:
-                cached_df = DATA_CACHE.get(symbol_code)
-            if cached_df is not None and signal_min in cached_df.index:
-                if next_min in cached_df.index:
-                    eval_c = cached_df.loc[signal_min]
-                    break
-
-            waited = (pd.Timestamp.now(tz="UTC") - close_at).total_seconds()
-            if waited >= 50:
-                res_df = get_candles(symbol_code, retries=1)
-                if res_df is not None and signal_min in res_df.index:
-                    if next_min in res_df.index or waited >= 95:
-                        eval_c = res_df.loc[signal_min]
+            res_df = get_candles(symbol_code, retries=1)
+            if res_df is not None:
+                if signal_min in res_df.index:
+                    row = res_df.loc[signal_min]
+                    c_val = float(row["close"])
+                    o_val = float(row["open"])
+                    waited = (pd.Timestamp.now(tz="UTC") - close_at).total_seconds()
+                    if (next_min in res_df.index) or (c_val != open_p) or (waited >= 12):
+                        eval_c = row
+                        if o_val != c_val and open_p == 0.0:
+                            open_p = o_val
+                        close_p = c_val
                         break
-            time.sleep(8)
+                elif next_min in res_df.index:
+                    eval_c = res_df.loc[next_min]
+                    close_p = float(eval_c["open"])
+                    break
+            time.sleep(3)
 
-        if eval_c is None:
+        if eval_c is None or close_p is None:
             send_result(embed=make_embed(
                 f"⚠️ ประเมินผลไม่ได้ · {asset}", COLOR_GRAY, "ดึงแท่งเทียนไม่ได้ ไม่นับเข้าสถิติ"))
             return
-
-        open_p, close_p = float(eval_c["open"]), float(eval_c["close"])
-        if open_p == close_p:
-            open_p = float(order.get("price", open_p))
 
         with stats_lock:
             if (signal == "BUY" and close_p > open_p) or (signal == "SELL" and close_p < open_p):
@@ -999,9 +997,11 @@ def evaluate_trade_background(order, signal_min):
         tot_g = g["win"] + g["loss"]
         wr_g = (g["win"] / tot_g * 100) if tot_g > 0 else 0.0
 
+        decimals = 3 if "JPY" in asset else 5
         sig_time = signal_min.tz_convert(tz_thai).strftime("%H:%M")
         send_result(embed=make_embed(
-            f"{icon} {word} · {asset}", color, advice,
+            f"{icon} {word} · {asset}", color,
+            f"{advice}\n💵 เปิด `{open_p:.{decimals}f}` ➔ ปิด `{close_p:.{decimals}f}`",
             fields=[
                 (f"📈 {asset}", f"`{s['win']}W – {s['loss']}L` · **{wr:.0f}%**", True),
                 ("🌐 รวมทั้งหมด", f"`{g['win']}W – {g['loss']}L` · **{wr_g:.0f}%**", True),
@@ -1013,7 +1013,7 @@ def evaluate_trade_background(order, signal_min):
             send_analysis(embed=make_embed(
                 f"🔍 วิเคราะห์ไม้แพ้ · {asset}", COLOR_RED,
                 f"{DIR_TEXT[signal]} · ไม้ {sig_time} · มั่นใจ {order['conf'] * 100:.0f}%\n"
-                f"แท่งปิด {move:+.2f} ATR ({'ตรงข้าม' if against > 0 else 'ตามทิศ'}ที่ทาย)",
+                f"💵 เปิด `{open_p:.{decimals}f}` ➔ ปิด `{close_p:.{decimals}f}` ({move:+.2f} ATR)",
                 fields=[
                     ("🧩 สาเหตุที่น่าจะเป็น", "\n".join(f"• {x}" for x in lines)[:1000], False),
                     ("🤔 ทำไมบอทเลือกทิศนี้", order.get("why", "-")[:300], False),
@@ -1167,6 +1167,7 @@ def background_worker():
 
 # ======================= ลูปหลัก =======================
 def main():
+    print("🚀 เริ่มต้นระบบบอท...")
     os.makedirs(DATA_DIR, exist_ok=True)
     load_all()
     rebuild_stats(load_trades())
@@ -1187,17 +1188,20 @@ def main():
     except Exception:
         pass
 
-    # ดึงกราฟและทำ Instant Warmup ทันทีตั้งแต่เปิดบอท (ใช้เวลา ~3 วินาที ได้ครบ 500+ ตัวอย่างทันที)
+    print("📡 กำลังส่งข้อความทดสอบเข้า Discord...")
+    send_main(f"🟢 **ระบบเริ่มทำงานแล้ว** · run `{BOOT_ID}` · กำลังเชื่อมต่อข้อมูลตลาดและเตรียมโมเดล...")
+    send_result(f"🏆 **Stats Bot พร้อมรายงานผล** · run `{BOOT_ID}`")
+    if DISCORD_NEWS_WEBHOOK:
+        send_news(f"📰 **ช่องวิเคราะห์พร้อมแล้ว** · สรุปข่าวจันทร์–ศุกร์ {NEWS_BRIEF_HOUR:02d}:00 น. · run `{BOOT_ID}`")
+
     if model.n < WARMUP_SAMPLES:
         print("⏳ กำลังดึงกราฟย้อนหลังเพื่อเรียนรู้ด่วน (Instant Warmup)...")
         init_data = fetch_all(UNIQUE_TICKERS)
-        warmup_from_history(init_data)
-
-    print("✅ บอทพร้อมใช้งานแล้ว")
-    send_main(f"🌐 **Main Bot พร้อมทำงาน (Instant Warmup)** · run `{BOOT_ID}` · 🧠 เรียนรู้แล้ว **{model.n:,}** ตัวอย่าง")
-    send_result(f"🏆 **Stats Bot พร้อมรายงานผล** · run `{BOOT_ID}`")
-    if DISCORD_NEWS_WEBHOOK:
-        send_news(f"📰 **ช่องวิเคราะห์พร้อมแล้ว** · สรุปข่าวจันทร์–ศุกร์ {NEWS_BRIEF_HOUR:02d}:00 น. · วิเคราะห์ไม้แพ้ทุกไม้ · run `{BOOT_ID}`")
+        print(f"📥 ดึงกราฟสำเร็จ {len(init_data)}/{len(UNIQUE_TICKERS)} คู่เงิน")
+        added = warmup_from_history(init_data)
+        send_main(f"⚡ **Instant Warmup เสร็จสิ้น** · เรียนรู้เพิ่ม `+{added}` ตัวอย่าง (สะสม **{model.n:,}** / {WARMUP_SAMPLES} ตัวอย่าง)")
+    else:
+        send_main(f"🧠 **โหลดโมเดลเดิมสำเร็จ** · เรียนรู้สะสมแล้ว **{model.n:,}** ตัวอย่าง พร้อมสแกนตลาดทันที!")
 
     threading.Thread(target=background_worker, daemon=True).start()
 
@@ -1226,7 +1230,6 @@ def main():
             current_min = now_utc.floor("min")
             current_sec = now_utc.second
 
-            # 1. สแกนล่วงหน้า ณ วินาทีที่ 45
             if current_sec >= SCAN_SECOND and last_pre_scan != current_min:
                 last_pre_scan = current_min
                 pending_order = None
@@ -1258,7 +1261,7 @@ def main():
                             ready = model.n >= WARMUP_SAMPLES
                             if not ready and not announce["warm"]:
                                 announce["warm"] = True
-                                send_main(f"🧠 กำลังเรียนรู้ก่อนเริ่มออกสัญญาณ ({model.n}/{WARMUP_SAMPLES} ตัวอย่าง)")
+                                send_main(f"🧠 กำลังเรียนรู้เพิ่มเติม ({model.n}/{WARMUP_SAMPLES} ตัวอย่าง)")
                             if ready and not announce["ready"]:
                                 announce["ready"] = True
                                 send_main(f"✅ เรียนรู้ครบแล้ว ({model.n:,} ตัวอย่าง) เริ่มคัดเลือกออเดอร์ที่มั่นใจที่สุด")
@@ -1293,7 +1296,6 @@ def main():
                     p = pending_order
                     send_main(f"⏳ **{p['asset']}** · {DIR_TEXT[p['dir']]} · มั่นใจ **{p['conf'] * 100:.0f}%** · เตรียมกด **{pre_time_str}**")
 
-            # 2. วินาทีที่ 1 ของนาทีถัดไป: ส่งสัญญาณเข้าออเดอร์จริง
             if (
                 current_sec >= 1
                 and last_action_min != current_min
